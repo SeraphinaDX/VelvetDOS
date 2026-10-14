@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.9.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.10.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.9.0", kernel)
+        self.assertIn(b"VelvetDOS 0.10.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE", "EXECHK.EXE", "BADMZ.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -214,7 +214,7 @@ class FloppyTest(unittest.TestCase):
             self.root[i*32:i*32+11]
             for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
         ]
-        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM"):
+        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
             self.assertIn(mkfloppy.dos_name(prog), names)
             self.assertGreater((BIN / prog).stat().st_size, 30)
 
@@ -264,7 +264,7 @@ class FloppyTest(unittest.TestCase):
                        ".L_dos_get_psp:", "cmdtail_len:", "last_exit_code:"):
             self.assertIn(marker, source)
         self.assertIn(".equ ENV_SEG,        0x2a00", source)
-        self.assertIn("mov word ptr es:[0x2c], ENV_SEG", source)
+        self.assertIn("mov word ptr es:[0x2c], ax", source)
         self.assertIn("mov byte ptr es:[di], 13", source)
         self.assertIn("mov word ptr es:[0x16], ax", source)
         self.assertIn("mov word ptr ss:[bp + 10], ax", source)
@@ -287,7 +287,7 @@ class FloppyTest(unittest.TestCase):
         exiting = (BIN / "EXITTEST.COM").read_bytes()
         self.assertIn(b"EXITTEST.COM: returning code 2A", exiting)
         self.assertIn(b"\xb8\x2a\x4c", exiting) # AX=4C2A
-        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM"):
+        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
             self.assertIn(mkfloppy.dos_name(name),
                           [self.root[i*32:i*32+11] for i in range(224)])
 
@@ -303,7 +303,7 @@ class FloppyTest(unittest.TestCase):
         self.assertIn("mov ax, 0x4b00", command)
         self.assertIn("mov ax, 0x4c00", command)
         self.assertIn("0x4e", command)  # DOS FindFirst
-        self.assertIn(b"COMMAND.COM 0.9.0", (BIN / "COMMAND.COM").read_bytes())
+        self.assertIn(b"COMMAND.COM 0.10.0", (BIN / "COMMAND.COM").read_bytes())
         self.assertIn(b"nested EXEC rejected", (BIN / "EXECCHK.COM").read_bytes())
 
     def test_process_memory_regions_do_not_overlap_kernel_or_data(self):
@@ -313,6 +313,21 @@ class FloppyTest(unittest.TestCase):
         self.assertIn("mov word ptr es:[3], CHILD_SEG - APP_SEG - 1", source)
         self.assertIn("mov word ptr es:[3], MEM_LIMIT - CHILD_SEG", source)
         self.assertTrue((BIN / "COMMAND.COM").stat().st_size < 0x10000 - 256)
+
+    def test_inherited_handle_and_environment_contract(self):
+        src = (ROOT / "kernel" / "kernel.s").read_text()
+        cmd = (ROOT / "programs" / "command.s").read_text()
+        for marker in ("release_handle:", "inherit_child_handles:",
+                       "copy_child_environment:", "handle_refs:",
+                       ".equ CHILD_ENV_SEG,  0x2b00",
+                       "call inherit_child_handles", "call copy_child_environment"):
+            self.assertIn(marker, src)
+        self.assertIn("call release_handle", src)
+        self.assertIn("jc do_hndtest", cmd)
+        self.assertIn("HNDTEST: parent handle preserved", cmd)
+        self.assertIn(b"HNDCHILD: inherited read, close, and environment PASS!",
+                      (BIN / "HNDCHILD.COM").read_bytes())
+        self.assertLessEqual((BIN / "kernel.bin").stat().st_size, 32768)
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):

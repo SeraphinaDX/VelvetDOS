@@ -1,4 +1,4 @@
-/* VelvetDOS 0.9.0 resident DOS command interpreter.
+/* VelvetDOS 0.10.0 resident DOS command interpreter.
  * SPDX-License-Identifier: GPL-3.0-only
  * This is a real .COM process which uses the documented DOS INT 21h API;
  * the kernel has a recovery prompt if COMMAND.COM exits or is unavailable.
@@ -78,6 +78,10 @@ command_loop:
     mov di, offset reboot_command
     call str_equal
     jc do_reboot
+    mov si, offset token
+    mov di, offset hndtest_command
+    call str_equal
+    jc do_hndtest
     mov si, offset token
     mov di, offset exit_command
     call str_equal
@@ -221,6 +225,59 @@ run_external:
     jmp command_loop
 .L_bad_name:
     mov dx, offset bad_command
+    call print_dollar
+    jmp command_loop
+
+/* Validate shell/child JFT sharing. The child consumes one byte and closes
+ * its own handle 5. COMMAND.COM must retain its own handle and see the next
+ * byte ('E'). Exercises AH=3D, 4B, 3F, 3E across process boundaries. */
+do_hndtest:
+    mov dx, offset readme_name
+    mov ax, 0x3d00
+    int 0x21
+    jc .L_hnd_fail
+    mov word ptr [hndtest_handle], ax
+    mov ax, cs
+    mov word ptr [exec_parameters+4], ax
+    mov dx, offset child_name
+    mov bx, offset exec_parameters
+    push ds
+    pop es
+    mov ax, 0x4b00
+    int 0x21
+    jc .L_hnd_cleanup_fail
+    mov ah, 0x4d
+    int 0x21
+    test al, al
+    jnz .L_hnd_cleanup_fail
+    /* The child overwrote its own PATH marker; ours must still be 'P'. */
+    mov bx, word ptr [0x2c]
+    mov es, bx
+    cmp byte ptr es:[0], 'P'
+    jne .L_hnd_cleanup_fail
+    mov bx, word ptr [hndtest_handle]
+    mov dx, offset hndtest_byte
+    mov cx, 1
+    mov ah, 0x3f
+    int 0x21
+    jc .L_hnd_cleanup_fail
+    cmp ax, 1
+    jne .L_hnd_cleanup_fail
+    cmp byte ptr [hndtest_byte], 'E'
+    jne .L_hnd_cleanup_fail
+    mov bx, word ptr [hndtest_handle]
+    mov ah, 0x3e
+    int 0x21
+    jc .L_hnd_fail
+    mov dx, offset hndtest_ok
+    call print_dollar
+    jmp command_loop
+.L_hnd_cleanup_fail:
+    mov bx, word ptr [hndtest_handle]
+    mov ah, 0x3e
+    int 0x21
+.L_hnd_fail:
+    mov dx, offset hndtest_bad
     call print_dollar
     jmp command_loop
 
@@ -372,11 +429,11 @@ nibble:
     int 0x21
     ret
 
-banner:       .ascii "\r\nVelvetDOS COMMAND.COM 0.9.0 [experimental]\r\n$"
+banner:       .ascii "\r\nVelvetDOS COMMAND.COM 0.10.0 [experimental]\r\n$"
 prefix:       .ascii "\r\nA:\\$"
 prompt_end:   .ascii ">$"
 crlf:         .ascii "\r\n$"
-help_text:    .ascii "HELP VER CLS DIR CD MD RD STATUS REBOOT EXIT\r\n"
+help_text:    .ascii "HELP VER CLS DIR CD MD RD STATUS HNDTEST REBOOT EXIT\r\n"
               .ascii "Run .COM and small MZ .EXE programs. Nested EXEC unavailable.\r\n$"
 status_text:  .ascii "Last exit code (hex): $"
 dir_failed:   .ascii "Directory operation failed.\r\n$"
@@ -392,6 +449,13 @@ rd_command:   .asciz "RD"
 status_command:.asciz "STATUS"
 reboot_command:.asciz "REBOOT"
 exit_command:.asciz "EXIT"
+hndtest_command:.asciz "HNDTEST"
+readme_name: .asciz "README.TXT"
+child_name: .asciz "HNDCHILD.COM"
+hndtest_ok: .ascii "HNDTEST: parent handle preserved across child close PASS!\r\n$"
+hndtest_bad: .ascii "HNDTEST: inherited handle regression FAIL!\r\n$"
+hndtest_handle: .word 0
+hndtest_byte: .byte 0
 search_mask:  .asciz "*.*"
 .align 2
 exec_parameters:

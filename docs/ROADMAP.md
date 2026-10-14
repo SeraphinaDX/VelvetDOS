@@ -23,3 +23,13 @@ optional 32-bit Free Pascal programs are future work. All code: GPLv3-only.
 
 Use disposable images. Preserve a regression for every fixed disk or DOS API
 bug, and never claim DOS compatibility based solely on static tests.
+
+## 0.10.0 — Handle ownership (preview)
+
+- Per-process file-handle tables and reference counting across one resident
+  shell and one DOS EXEC child.
+- Bounded copied child environment, preserving parent's environment.
+- `HNDTEST` and `HNDCHILD.COM` parent/child I/O regression.
+- **After emulator validation:** consider more complete conventional-memory
+  allocation ownership and resize handling, preserving parent MCBs across
+  EXEC. Do not introduce Pascal until a 386-class DOS extender works.

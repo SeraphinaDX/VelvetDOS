@@ -1,5 +1,22 @@
 # VelvetDOS changelog
 
+## 0.10.0 — DOS handle inheritance and bounded process environment (2026-10-14)
+
+- Add four per-process PSP JFT file-handle slots and reference-counted kernel
+  file records. Preserve shell handles when a child exits or closes one.
+- Stage an independent 256-byte environment for a DOS EXEC child and point
+  the child's PSP:002Ch to the copy. Support a nonzero environment pointer in
+  the EXEC parameter block within this bounded prototype.
+- Add `HNDCHILD.COM` and `COMMAND.COM`'s `HNDTEST` built-in to exercise an
+  inherited read/close and verify the parent can continue reading.
+- Expand the offline test suite from 28 to 29 host-side tests.
+- Retain 8086 compatibility and defer full dynamic MCB ownership and DOS
+  handle duplication to later milestones.
+
+**Validation:** Offline assembly, FAT12 image creation, and structural tests
+passed. Runtime behavior in 86Box is not yet verified.
+
+
 ## 0.9.0 — Bounded MZ child EXEC (2026-10-14)
 
 - Extend resident COMMAND.COM EXEC beyond `.COM` to limited relocatable DOS

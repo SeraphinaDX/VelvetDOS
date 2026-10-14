@@ -1,4 +1,4 @@
-/* VelvetDOS 0.9.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.10.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and bounded multi-cluster directories (8.3); one resident shell
@@ -19,7 +19,8 @@
 .equ APP_SEG,        0x3000
 .equ CHILD_SEG,      0x5000
 .equ CHILD_MCB,      0x4fff
-.equ ENV_SEG,        0x2a00  /* read-only bootstrap environment below MEM_MCB */
+.equ ENV_SEG,        0x2a00  /* resident shell environment */
+.equ CHILD_ENV_SEG,  0x2b00  /* bounded 256-byte child environment staging */
 .equ ROOT_SECTOR,    83
 .equ FAT_SECTOR,     65
 .equ ROOT_ENTRIES,   224
@@ -780,6 +781,9 @@ reset_mcb:
     mov cx, 64
     xor al, al
     rep stosb
+    mov di, offset handle_refs
+    mov cx, 4
+    rep stosb
     mov word ptr [rw_cached_sector], 0xffff
     mov byte ptr [rw_cache_dirty], 0
     mov ax, MEM_MCB
@@ -861,7 +865,8 @@ make_psp:
     /* Conventional PSP parent pointer: zero for primary shell. */
     mov ax, word ptr [psp_parent]
     mov word ptr es:[0x16], ax
-    mov word ptr es:[0x2c], ENV_SEG
+    mov ax, word ptr [current_env_seg]
+    mov word ptr es:[0x2c], ax
     /* Standard inherited handle table (0..4; 5..19 unused). */
     mov di, 0x18
     mov cx, 20
@@ -1264,12 +1269,22 @@ find_directory:
 .L_fdir_leave:
     ret
 
-/* BX=handle id (5..8), return BX=handle table address or CF=1. */
+/* BX=per-process handle (5..8); validate the PSP JFT before accessing the
+ * shared kernel file record. Inherited handles share their file position.
+ * Preserve AX and ES; BX becomes a pointer to the kernel record. */
 locate_handle:
     cmp bx, 5
     jb .L_lh_err
     cmp bx, 8
     ja .L_lh_err
+    push ax
+    push es
+    mov ax, word ptr [current_psp]
+    mov es, ax
+    cmp byte ptr es:[bx + 0x18], bl
+    jne .L_lh_inactive
+    pop es
+    pop ax
     sub bx, 5
     push ax
     mov ax, 16
@@ -1281,6 +1296,9 @@ locate_handle:
     jne .L_lh_err
     clc
     ret
+.L_lh_inactive:
+    pop es
+    pop ax
 .L_lh_err:
     stc
     ret
@@ -1439,6 +1457,91 @@ start_com:
     xor ax, ax
     retf
 
+/* Copy parent's four file JFT slots to child and increase reference counts.
+ * Std handles 0..4 are initialized by make_psp. An inherited close does not
+ * invalidate the parent's copy of the same DOS file handle. */
+inherit_child_handles:
+    push ax
+    push bx
+    push si
+    push ds
+    push es
+    mov ax, APP_SEG
+    mov ds, ax
+    mov ax, CHILD_SEG
+    mov es, ax
+    mov bx, 5
+.L_ich_next:
+    mov al, byte ptr [bx + 0x18]
+    cmp al, 0xff
+    je .L_ich_skip
+    mov byte ptr es:[bx + 0x18], al
+    mov si, bx
+    sub si, 5
+    inc byte ptr cs:[handle_refs + si]
+.L_ich_skip:
+    inc bx
+    cmp bx, 9
+    jb .L_ich_next
+    pop es
+    pop ds
+    pop si
+    pop bx
+    pop ax
+    ret
+
+/* Copy at most 256 bytes of the requested parent environment into an
+ * independent child staging segment. Reject unterminated environments to
+ * avoid silently changing the child's variable strings. */
+copy_child_environment:
+    push ax
+    push bx
+    push cx
+    push si
+    push di
+    push ds
+    push es
+    mov ax, word ptr [exec_env_source]
+    test ax, ax
+    jnz .L_ce_source
+    mov ax, APP_SEG
+    mov es, ax
+    mov ax, word ptr es:[0x2c]
+.L_ce_source:
+    test ax, ax
+    jz .L_ce_fail
+    mov ds, ax
+    mov ax, CHILD_ENV_SEG
+    mov es, ax
+    xor si, si
+    xor di, di
+    mov cx, 256
+    rep movsb
+    xor si, si
+    mov cx, 255
+.L_ce_scan:
+    cmp byte ptr es:[si], 0
+    jne .L_ce_next
+    cmp byte ptr es:[si + 1], 0
+    je .L_ce_ok
+.L_ce_next:
+    inc si
+    loop .L_ce_scan
+.L_ce_fail:
+    stc
+    jmp .L_ce_done
+.L_ce_ok:
+    clc
+.L_ce_done:
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 /* Software INT 20h process exit. App stack is discarded. */
 int20_handler:
     mov byte ptr cs:[last_exit_code], 0
@@ -1467,6 +1570,7 @@ process_exit:
     mov word ptr [current_psp], APP_SEG
     mov word ptr [exec_load_segment], APP_SEG
     mov word ptr [psp_parent], 0
+    mov word ptr [current_env_seg], ENV_SEG
     mov byte ptr [exec_active], 0
     mov ax, word ptr [exec_parent_dta_seg]
     mov word ptr [dta_seg], ax
@@ -2034,10 +2138,8 @@ int21_handler:
     jmp .L_set_error
 .L_dos_close:
     mov bx, word ptr ss:[bp + 10]
-    call locate_handle
+    call release_handle
     jc .L_invalid_handle
-    call update_root_handle
-    mov byte ptr [bx], 0
     call flush_metadata
     jc .L_write_failure
     xor ax, ax
@@ -2456,8 +2558,8 @@ prepare_child_exe:
     mov ax, word ptr ss:[bp + 12]
     mov es, ax
     mov bx, word ptr ss:[bp + 10]
-    cmp word ptr es:[bx], 0    /* inherit environment only */
-    jne .L_exec_bad_function
+    mov ax, word ptr es:[bx]
+    mov word ptr [exec_env_source], ax
     mov di, word ptr es:[bx + 2]
     mov ax, word ptr es:[bx + 4]
     test ax, ax
@@ -2495,6 +2597,8 @@ prepare_child_exe:
     call prepare_child_exe
     jc .L_exec_load_failed
 .L_exec_image_ready:
+    call copy_child_environment
+    jc .L_exec_bad_environment
     mov ax, word ptr [dta_seg]
     mov word ptr [exec_parent_dta_seg], ax
     mov ax, word ptr [dta_off]
@@ -2518,8 +2622,10 @@ prepare_child_exe:
     mov word ptr es:[2], CHILD_SEG
     mov word ptr [current_psp], CHILD_SEG
     mov word ptr [psp_parent], APP_SEG
+    mov word ptr [current_env_seg], CHILD_ENV_SEG
     mov byte ptr [exec_active], 1
     call make_psp
+    call inherit_child_handles
     cli
     mov ax, CHILD_SEG
     mov ds, ax
@@ -2547,6 +2653,10 @@ prepare_child_exe:
     sti
     xor ax, ax
     jmp far ptr cs:[exe_ip]
+.L_exec_bad_environment:
+    mov word ptr [exec_load_segment], APP_SEG
+    mov ax, 10 /* invalid environment */
+    jmp .L_set_error
 .L_exec_load_failed:
     mov word ptr [exec_load_segment], APP_SEG
     mov ax, 11 /* invalid EXE format / incomplete load */
@@ -3307,6 +3417,19 @@ fill_handle:
     mov word ptr [si + 12], ax
     mov ax, word ptr [dir_parent_cluster]
     mov word ptr [si + 14], ax
+    /* Expose a new handle only in its owner's PSP; refcount starts at 1. */
+    push bx
+    push dx
+    push es
+    mov bx, dx
+    sub bx, 5
+    mov byte ptr [handle_refs + bx], 1
+    mov ax, word ptr [current_psp]
+    mov es, ax
+    mov byte ptr es:[bx + 0x1d], dl
+    pop es
+    pop dx
+    pop bx
     ret
 
 /* Find an unused 32-byte slot, growing a full subdirectory by one
@@ -3610,17 +3733,55 @@ update_root_handle:
     pop ax
     ret
 
-/* Called when application returns without closing all its handles. */
+/* Release one JFT handle from current PSP. BX=5..8, CF=1 if invalid.
+ * The underlying file record is closed only after its last reference goes.
+ * Preserves general registers except flags, allowing process-exit cleanup. */
+release_handle:
+    push ax
+    push bx
+    push cx
+    push di
+    push es
+    call locate_handle
+    jc .L_rh_invalid
+    /* Locate JFT slot by reverse-mapping the shared record pointer. */
+    mov di, bx
+    sub di, offset handles
+    mov cl, 4
+    shr di, cl
+    mov ax, word ptr [current_psp]
+    mov es, ax
+    mov byte ptr es:[di + 0x1d], 0xff
+    cmp byte ptr [handle_refs + di], 0
+    je .L_rh_invalid
+    dec byte ptr [handle_refs + di]
+    jnz .L_rh_ok
+    call update_root_handle
+    mov byte ptr [bx], 0
+.L_rh_ok:
+    clc
+    jmp .L_rh_done
+.L_rh_invalid:
+    stc
+.L_rh_done:
+    pop es
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Called at process exit: release ONLY this PSP's JFT references. The
+ * resident COMMAND.COM's file records survive termination of a child. */
 close_all_handles:
     push ax
     push bx
     push cx
-    mov bx, offset handles
+    mov bx, 5
     mov cx, 4
 .L_cah_loop:
-    call update_root_handle
-    mov byte ptr [bx], 0
-    add bx, 16
+    call release_handle
+    inc bx
     loop .L_cah_loop
     call flush_metadata
     jnc .L_cah_ok
@@ -3906,6 +4067,7 @@ rw_cached_sector:  .word 0xffff
 rw_mode:           .byte 0
 .align 2
 handles:           .space 64  /* 4 x 16-byte read/write handle records */
+handle_refs:       .space 4   /* references across shell + child JFTs */
 open_mode:         .byte 0
 file_attributes:   .byte 0
 fs_dirty:          .byte 0
@@ -3959,6 +4121,8 @@ saved_parent_cluster:.word 0
 /* A minimal non-reentrant EXEC context; kernel shell is a recovery fallback. */
 current_psp:        .word APP_SEG
 psp_parent:         .word 0
+current_env_seg:    .word ENV_SEG
+exec_env_source:    .word 0
 exec_load_segment:  .word APP_SEG
 exec_active:        .byte 0
 exec_exe_mode:      .byte 0
@@ -3983,7 +4147,7 @@ environment_template:
     .word 1
     .asciz "A:\\VELVETDOS"
 environment_end:
-banner:             .asciz "\r\nVelvetDOS 0.9.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.10.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
