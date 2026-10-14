@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the VelvetDOS 0.3.0 FAT12 floppy from boot/kernel binaries.
+"""Build the VelvetDOS 0.4.0 FAT12 floppy from boot/kernel binaries.
 
 License: GPL-3.0-only. No external Python packages required.
 The kernel lives in reserved sectors 1..64. This is a private bootstrap

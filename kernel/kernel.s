@@ -1,7 +1,7 @@
-/* VelvetDOS 0.3.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.4.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
- * Writable FAT12 root directory (8.3 only); one DOS application at a time.
+ * FAT12 root and single-cluster subdirectories (8.3 only); one DOS application at a time.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -12,6 +12,7 @@
 .equ ROOT_SEG,       0x2000
 .equ FAT_SEG,        0x2200
 .equ IO_SEG,         0x2400
+.equ DIR_SEG,        0x2600
 .equ MEM_LIMIT,      0x9000
 .equ MEM_MCB,        0x2fff
 .equ APP_SEG,        0x3000
@@ -49,6 +50,10 @@ shell_loop:
     mov sp, offset stack_end
     mov si, offset prompt
     call print_z
+    mov si, offset cwd_text
+    call print_z
+    mov al, '>'
+    call putc
     call read_line
     cmp byte ptr [cmdline], 0
     je shell_loop
@@ -72,6 +77,45 @@ shell_loop:
     mov di, offset cmd_reboot
     call str_eq
     jc do_reboot
+    /* The prototype shell accepts one directory path after CD/MD/RD. */
+    mov si, offset cmdline
+    cmp word ptr [si], 0x4443   /* CD */
+    jne .L_shell_check_md
+    cmp byte ptr [si + 2], ' '
+    jne .L_shell_check_md
+    add si, 3
+    mov ax, cs
+    mov es, ax
+    call dos_chdir
+    jc shell_dir_error
+    jmp shell_loop
+.L_shell_check_md:
+    mov si, offset cmdline
+    cmp word ptr [si], 0x444d   /* MD */
+    jne .L_shell_check_rd
+    cmp byte ptr [si + 2], ' '
+    jne .L_shell_check_rd
+    add si, 3
+    mov ax, cs
+    mov es, ax
+    call dos_mkdir
+    jc shell_dir_error
+    jmp shell_loop
+.L_shell_check_rd:
+    mov si, offset cmdline
+    cmp word ptr [si], 0x4452   /* RD */
+    jne .L_shell_no_directory_cmd
+    cmp byte ptr [si + 2], ' '
+    jne .L_shell_no_directory_cmd
+    add si, 3
+    mov ax, cs
+    mov es, ax
+    call dos_rmdir
+    jc shell_dir_error
+    jmp shell_loop
+.L_shell_no_directory_cmd:
+    mov ax, word ptr [cwd_cluster]
+    mov word ptr [dir_parent_cluster], ax
     call prepare_filename
     jc bad_command
     /* Recognize explicit .EXE as well as .COM; default remains .COM. */
@@ -83,6 +127,8 @@ shell_loop:
     jne bad_command
     call find_file
     jc bad_command
+    test byte ptr [file_attributes], 0x10
+    jnz bad_command
     call load_com
     jc .L_shell_loop_load_error
     call start_exe      /* validates MZ header and applies relocations */
@@ -111,16 +157,24 @@ shell_loop:
     mov byte ptr [filename + 10], 'E'
     call find_file
     jc bad_command
+    test byte ptr [file_attributes], 0x10
+    jnz bad_command
     call load_com
     jc .L_shell_loop_load_error
     call start_exe
     jmp .L_shell_loop_load_error
 .L_shell_load_com:
+    test byte ptr [file_attributes], 0x10
+    jnz bad_command
     call load_com
     jc .L_shell_loop_load_error
     call start_com     /* does not return; app returns through INT 20h/21h */
 .L_shell_loop_load_error:
     mov si, offset load_error_message
+    call print_z
+    jmp shell_loop
+shell_dir_error:
+    mov si, offset dir_error_message
     call print_z
     jmp shell_loop
 bad_command:
@@ -147,19 +201,22 @@ do_reboot:
 do_dir:
     mov si, offset dir_header
     call print_z
-    mov ax, ROOT_SEG
-    mov es, ax
+    mov ax, word ptr [cwd_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    call select_directory
+    jc shell_dir_error
     xor di, di
-    mov cx, ROOT_ENTRIES
 .L_do_dir_next:
     cmp byte ptr es:[di], 0
     je .L_do_dir_done
     cmp byte ptr es:[di], 0xe5
     je .L_do_dir_skip
     mov al, byte ptr es:[di + 11]
-    test al, 0x18    /* no volume labels/directories for this version */
+    test al, 0x08           /* volume label */
     jnz .L_do_dir_skip
-    cmp al, 0x0f     /* skip long filename entries */
+    cmp al, 0x0f
+    je .L_do_dir_skip
+    cmp byte ptr es:[di], '.'
     je .L_do_dir_skip
     push cx
     mov bx, di
@@ -178,6 +235,11 @@ do_dir:
     inc si
     cmp si, 11
     jb .L_do_dir_ext
+    test byte ptr es:[di + 11], 0x10
+    jz .L_do_dir_newline
+    mov si, offset dir_marker
+    call print_z
+.L_do_dir_newline:
     call newline
     pop cx
 .L_do_dir_skip:
@@ -355,65 +417,6 @@ prepare_filename:
 .L_prepare_filename_exit:
     pop di
     pop si
-    pop cx
-    pop bx
-    pop ax
-    ret
-
-/* Search FAT root for 8.3 file, setting file_cluster/file_size.
- * CF=0 found, CF=1 missing. Directories/volume entries excluded. */
-find_file:
-    push ax
-    push bx
-    push cx
-    push dx
-    push si
-    push di
-    push es
-    mov ax, ROOT_SEG
-    mov es, ax
-    xor di, di
-    mov cx, ROOT_ENTRIES
-.L_find_file_entry:
-    cmp byte ptr es:[di], 0
-    je .L_find_file_not_found
-    cmp byte ptr es:[di], 0xe5
-    je .L_find_file_next
-    mov al, byte ptr es:[di + 11]
-    test al, 0x18
-    jnz .L_find_file_next
-    cmp al, 0x0f
-    je .L_find_file_next
-    xor bx, bx
-    mov si, offset filename
-.L_find_file_cmp:
-    mov al, byte ptr [si + bx]
-    cmp al, byte ptr es:[di + bx]
-    jne .L_find_file_next
-    inc bx
-    cmp bx, 11
-    jb .L_find_file_cmp
-    mov ax, word ptr es:[di + 26]
-    mov word ptr [file_cluster], ax
-    mov ax, word ptr es:[di + 28]
-    mov word ptr [file_size], ax
-    mov ax, word ptr es:[di + 30]
-    mov word ptr [file_size_high], ax
-    mov word ptr [file_dir_offset], di
-    mov al, byte ptr es:[di + 11]
-    mov byte ptr [file_attributes], al
-    clc
-    jmp .L_find_file_exit
-.L_find_file_next:
-    add di, 32
-    loop .L_find_file_entry
-.L_find_file_not_found:
-    stc
-.L_find_file_exit:
-    pop es
-    pop di
-    pop si
-    pop dx
     pop cx
     pop bx
     pop ax
@@ -667,9 +670,12 @@ make_psp:
     pop ax
     ret
 
-/* Normalize one root-directory 8.3 path supplied as ASCIIZ in ES:SI.
- * Uppercases ASCII and optionally accepts A: or A:\ prefix.
- * No subdirectories (intentional, reported as file not found).
+/* Resolve an ASCIIZ DOS 8.3 path at ES:SI.
+ * dir_parent_cluster = directory holding final name (0 is FAT root).
+ * filename = final 11-byte name, path_directory_only=1 for a path
+ * resolving directly to a directory (root, ".", or "..").
+ * A maximum of eight nested directory levels is supported in 0.4.0.
+ * dir_path_stack holds the cluster at each traversed level.
  */
 filename_from_es_si:
     push ax
@@ -677,91 +683,302 @@ filename_from_es_si:
     push cx
     push dx
     push di
-    mov di, offset filename
-    mov cx, 11
-    mov al, ' '
-    push es
-    push cs
-    pop es
-    rep stosb
-    pop es
-    xor bx, bx
+    mov byte ptr [path_directory_only], 0
+    mov al, byte ptr [cwd_depth]
+    mov byte ptr [path_depth], al
+    mov cx, 8
+    mov di, offset cwd_stack
+    mov bx, offset path_stack
+.L_path_copy_stack:
+    mov ax, word ptr [di]
+    mov word ptr [bx], ax
+    add di, 2
+    add bx, 2
+    loop .L_path_copy_stack
+    mov ax, word ptr [cwd_cluster]
+    mov word ptr [dir_parent_cluster], ax
     cmp byte ptr es:[si + 1], ':'
-    jne .L_fn_base
+    jne .L_path_absolute
     mov al, byte ptr es:[si]
     and al, 0xdf
     cmp al, 'A'
-    jne .L_fn_err
+    jne .L_path_fail
     add si, 2
-    cmp byte ptr es:[si], '\'
-    je .L_fn_skip_slash
-    cmp byte ptr es:[si], '/'
-    jne .L_fn_base
-.L_fn_skip_slash:
-    inc si
-.L_fn_base:
+.L_path_absolute:
     mov al, byte ptr es:[si]
-    inc si
-    cmp al, 0
-    je .L_fn_finish
-    cmp al, '.'
-    je .L_fn_ext
-    cmp al, ' '
-    jbe .L_fn_err
-    cmp al, '\'
-    je .L_fn_err
+    cmp al, 0x5c  /* ASCII backslash; GAS char-literal form misassembles */
+    je .L_path_root
     cmp al, '/'
-    je .L_fn_err
-    cmp bx, 8
-    jae .L_fn_err
+    jne .L_path_component
+.L_path_root:
+    mov word ptr [dir_parent_cluster], 0
+    mov byte ptr [path_depth], 0
+    inc si
+.L_path_component:
+    cmp byte ptr es:[si], 0
+    jne .L_path_dot
+    mov byte ptr [path_directory_only], 1
+    clc
+    jmp .L_path_exit
+.L_path_dot:
+    cmp byte ptr es:[si], '.'
+    jne .L_path_normal
+    mov al, byte ptr es:[si + 1]
+    cmp al, 0
+    je .L_path_dot_one_end
+    cmp al, 0x5c  /* ASCII backslash; GAS char-literal form misassembles */
+    je .L_path_dot_one_sep
+    cmp al, '/'
+    je .L_path_dot_one_sep
+    cmp al, '.'
+    jne .L_path_normal
+    mov al, byte ptr es:[si + 2]
+    cmp al, 0
+    je .L_path_dot_two_end
+    cmp al, 0x5c  /* ASCII backslash; GAS char-literal form misassembles */
+    je .L_path_dot_two_sep
+    cmp al, '/'
+    jne .L_path_normal
+.L_path_dot_two_sep:
+    add si, 3
+    jmp .L_path_pop_parent
+.L_path_dot_two_end:
+    add si, 2
+    jmp .L_path_pop_parent
+.L_path_dot_one_sep:
+    add si, 2
+    jmp .L_path_component
+.L_path_dot_one_end:
+    inc si
+    jmp .L_path_component
+.L_path_pop_parent:
+    cmp byte ptr [path_depth], 0
+    je .L_path_component
+    dec byte ptr [path_depth]
+    mov bl, byte ptr [path_depth]
+    xor bh, bh
+    shl bx, 1
+    cmp bx, 0
+    jne .L_path_parent_nonroot
+    mov word ptr [dir_parent_cluster], 0
+    jmp .L_path_component
+.L_path_parent_nonroot:
+    mov ax, word ptr [path_stack + bx - 2]
+    mov word ptr [dir_parent_cluster], ax
+    jmp .L_path_component
+.L_path_normal:
+    /* Decode a single 8.3 component in the kernel data segment. */
+    push es
+    push cs
+    pop es
+    mov di, offset filename
+    mov cx, 11
+    mov al, ' '
+    rep stosb
+    pop es
+    xor bx, bx
+    xor dx, dx           /* DL=extension length, DH=in extension */
+.L_path_char:
+    mov al, byte ptr es:[si]
+    test al, al
+    jz .L_path_final
+    cmp al, 0x5c  /* ASCII backslash; GAS char-literal form misassembles */
+    je .L_path_descend
+    cmp al, '/'
+    je .L_path_descend
+    cmp al, '.'
+    jne .L_path_char_plain
+    test dh, dh
+    jnz .L_path_fail
+    mov dh, 1
+    inc si
+    jmp .L_path_char
+.L_path_char_plain:
+    cmp al, ' '
+    jbe .L_path_fail
+    cmp al, ':'
+    je .L_path_fail
     cmp al, 'a'
-    jb .L_fn_store_base
+    jb .L_path_case_done
     cmp al, 'z'
-    ja .L_fn_store_base
+    ja .L_path_case_done
     sub al, 32
-.L_fn_store_base:
+.L_path_case_done:
+    test dh, dh
+    jnz .L_path_extension
+    cmp bx, 8
+    jae .L_path_fail
     mov byte ptr [filename + bx], al
     inc bx
-    jmp .L_fn_base
-.L_fn_ext:
-    xor bx, bx
-.L_fn_ext_loop:
-    mov al, byte ptr es:[si]
     inc si
-    test al, al
-    jz .L_fn_finish
-    cmp al, ' '
-    jbe .L_fn_err
-    cmp al, '.'
-    je .L_fn_err
-    cmp al, '\'
-    je .L_fn_err
-    cmp al, '/'
-    je .L_fn_err
-    cmp bx, 3
-    jae .L_fn_err
-    cmp al, 'a'
-    jb .L_fn_store_ext
-    cmp al, 'z'
-    ja .L_fn_store_ext
-    sub al, 32
-.L_fn_store_ext:
+    jmp .L_path_char
+.L_path_extension:
+    cmp dl, 3
+    jae .L_path_fail
+    push bx
+    xor bh, bh
+    mov bl, dl
     mov byte ptr [filename + bx + 8], al
-    inc bx
-    jmp .L_fn_ext_loop
-.L_fn_finish:
+    pop bx
+    inc dl
+    inc si
+    jmp .L_path_char
+.L_path_descend:
     cmp byte ptr [filename], ' '
-    je .L_fn_err
+    je .L_path_fail
+    /* Every nonterminal component must name a real subdirectory. */
+    call find_directory
+    jc .L_path_fail
+    cmp byte ptr [path_depth], 8
+    jae .L_path_fail
+    mov bl, byte ptr [path_depth]
+    xor bh, bh
+    shl bx, 1
+    mov ax, word ptr [file_cluster]
+    mov word ptr [path_stack + bx], ax
+    mov word ptr [dir_parent_cluster], ax
+    inc byte ptr [path_depth]
+    inc si
+    jmp .L_path_component
+.L_path_final:
+    cmp byte ptr [filename], ' '
+    je .L_path_fail
     clc
-    jmp .L_fn_leave
-.L_fn_err:
+    jmp .L_path_exit
+.L_path_fail:
     stc
-.L_fn_leave:
+.L_path_exit:
     pop di
     pop dx
     pop cx
     pop bx
     pop ax
+    ret
+
+/* Return ES view and CX number of 32-byte entries for selected directory.
+ * A non-root directory occupies exactly one FAT12 cluster in this version.
+ * CF=1 when BIOS cannot read it. Preserves AX/BX/DX/SI/DI. */
+select_directory:
+    push ax
+    push bx
+    mov ax, word ptr [dir_parent_cluster]
+    test ax, ax
+    jnz .L_sd_subdir
+    mov ax, ROOT_SEG
+    mov es, ax
+    mov cx, ROOT_ENTRIES
+    clc
+    jmp .L_sd_exit
+.L_sd_subdir:
+    cmp ax, 2
+    jb .L_sd_error
+    cmp ax, 2784
+    ja .L_sd_error
+    add ax, DATA_BIAS
+    push ax
+    mov ax, DIR_SEG
+    mov es, ax
+    pop ax
+    xor bx, bx
+    call read_sector
+    mov cx, 16
+    jmp .L_sd_exit
+.L_sd_error:
+    stc
+.L_sd_exit:
+    pop bx
+    pop ax
+    ret
+
+/* Commit the selected directory if it is not the in-memory FAT root. */
+flush_directory:
+    push ax
+    push bx
+    push es
+    mov ax, word ptr [dir_parent_cluster]
+    test ax, ax
+    jz .L_fd_root
+    add ax, DATA_BIAS
+    push ax
+    mov ax, DIR_SEG
+    mov es, ax
+    pop ax
+    xor bx, bx
+    call write_sector
+    jmp .L_fd_done
+.L_fd_root:
+    mov byte ptr [fs_dirty], 1
+    clc
+.L_fd_done:
+    pop es
+    pop bx
+    pop ax
+    ret
+
+/* Lookup any matching file or directory; reject volume/LFN entries. */
+find_file:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    call select_directory
+    jc .L_find_file_not_found
+    xor di, di
+.L_find_file_entry:
+    cmp byte ptr es:[di], 0
+    je .L_find_file_not_found
+    cmp byte ptr es:[di], 0xe5
+    je .L_find_file_next
+    mov al, byte ptr es:[di + 11]
+    test al, 0x08
+    jnz .L_find_file_next
+    cmp al, 0x0f
+    je .L_find_file_next
+    xor bx, bx
+    mov si, offset filename
+.L_find_file_cmp:
+    mov al, byte ptr [si + bx]
+    cmp al, byte ptr es:[di + bx]
+    jne .L_find_file_next
+    inc bx
+    cmp bx, 11
+    jb .L_find_file_cmp
+    mov ax, word ptr es:[di + 26]
+    mov word ptr [file_cluster], ax
+    mov ax, word ptr es:[di + 28]
+    mov word ptr [file_size], ax
+    mov ax, word ptr es:[di + 30]
+    mov word ptr [file_size_high], ax
+    mov word ptr [file_dir_offset], di
+    mov al, byte ptr es:[di + 11]
+    mov byte ptr [file_attributes], al
+    clc
+    jmp .L_find_file_exit
+.L_find_file_next:
+    add di, 32
+    loop .L_find_file_entry
+.L_find_file_not_found:
+    stc
+.L_find_file_exit:
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+find_directory:
+    call find_file
+    jc .L_fdir_leave
+    test byte ptr [file_attributes], 0x10
+    jnz .L_fdir_leave
+    stc
+.L_fdir_leave:
     ret
 
 /* BX=handle id (5..8), return BX=handle table address or CF=1. */
@@ -987,6 +1204,14 @@ int21_handler:
     je .L_int21_handler_default_drive
     cmp ah, 0x30
     je .L_int21_handler_version
+    cmp ah, 0x39
+    je .L_dos_mkdir
+    cmp ah, 0x3a
+    je .L_dos_rmdir
+    cmp ah, 0x3b
+    je .L_dos_chdir
+    cmp ah, 0x47
+    je .L_dos_getcwd
     cmp ah, 0x3c
     je .L_dos_create
     cmp ah, 0x3d
@@ -1095,7 +1320,64 @@ int21_handler:
     mov ax, 0x1606  /* MS-DOS 6.22 version encoding; compatibility target */
     xor bx, bx
     jmp .L_int21_handler_return
-/* FAT12 root-only file APIs (four handles: 5..8).
+/* Directory syscall wrappers: DS:DX input, DS:SI output for AH=47h. */
+.L_dos_mkdir:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call dos_mkdir
+    jc .L_set_error
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_rmdir:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call dos_rmdir
+    jc .L_set_error
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_chdir:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call dos_chdir
+    jc .L_set_error
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_getcwd:
+    mov al, byte ptr ss:[bp + 6] /* DL drive number: 0=current, 1=A: */
+    cmp al, 1
+    ja .L_getcwd_bad
+    /* DOS callers typically allocate a 64-byte buffer for AH=47h. */
+    mov si, offset cwd_text
+    mov cx, 64
+.L_getcwd_length:
+    cmp byte ptr [si], 0
+    je .L_getcwd_length_ok
+    inc si
+    loop .L_getcwd_length
+    mov ax, 3
+    jmp .L_set_error
+.L_getcwd_length_ok:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov di, word ptr ss:[bp + 4]
+    mov si, offset cwd_text
+.L_getcwd_copy:
+    mov al, byte ptr [si]
+    mov byte ptr es:[di], al
+    inc di
+    inc si
+    test al, al
+    jnz .L_getcwd_copy
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_getcwd_bad:
+    mov ax, 15
+    jmp .L_set_error
+
+/* FAT12 8.3 file APIs (four handles: 5..8).
  * 3Ch create/truncate, 3Dh open R/W, 3Eh close, 3Fh read, 40h write,
  * 41h delete, 42h seek. No directory paths or sharing yet.
  * Handle layout: used(0), mode(1), cluster(2), pos(4,6), size(8,10),
@@ -1111,8 +1393,12 @@ int21_handler:
     mov si, word ptr ss:[bp + 6]
     call filename_from_es_si
     jc .L_open_not_found
+    cmp byte ptr [path_directory_only], 0
+    jne .L_open_not_found
     call find_file
     jc .L_open_not_found
+    test byte ptr [file_attributes], 0x10
+    jnz .L_open_denied
     test byte ptr [file_attributes], 1
     jz .L_open_get_slot
     cmp byte ptr [open_mode], 0
@@ -1135,7 +1421,7 @@ int21_handler:
 .L_open_not_found:
     mov ax, 2
     jmp .L_set_error
-/* DOS 3Ch creates or truncates an 8.3 root file. CX=attributes.
+/* DOS 3Ch creates or truncates an 8.3 file in a supported directory. CX=attributes.
  * Existing read-only files are protected. A new file is empty and has
  * first cluster 0 until the first successful allocation.
  */
@@ -1148,12 +1434,16 @@ int21_handler:
     mov si, word ptr ss:[bp + 6]
     call filename_from_es_si
     jc .L_open_denied
+    cmp byte ptr [path_directory_only], 0
+    jne .L_open_denied
     call find_handle_slot
     jc .L_open_no_slots
     mov word ptr [new_handle], si
     mov word ptr [new_handle_number], dx
     call find_file
     jc .L_create_new
+    test byte ptr [file_attributes], 0x10
+    jnz .L_open_denied
     test byte ptr [file_attributes], 1
     jnz .L_open_denied
     /* Safeguard against truncating a file opened by another handle. */
@@ -1166,8 +1456,8 @@ int21_handler:
     call find_free_root
     jc .L_create_full
 .L_create_initialize:
-    mov ax, ROOT_SEG
-    mov es, ax
+    call select_directory
+    jc .L_write_failure
     mov di, word ptr [file_dir_offset]
     push di
     mov cx, 16
@@ -1192,7 +1482,8 @@ int21_handler:
     mov dx, word ptr [new_handle_number]
     mov byte ptr [si + 1], 2 /* read/write */
     call fill_handle
-    mov byte ptr [fs_dirty], 1
+    call flush_directory
+    jc .L_write_failure
     call flush_metadata
     jc .L_write_failure
     mov ax, dx
@@ -1257,26 +1548,31 @@ int21_handler:
 .L_read_disk_error:
     mov ax, 30
     jmp .L_set_error
-/* DOS AH=41h remove root file, releasing its FAT cluster chain. */
+/* DOS AH=41h removes an 8.3 file and releases its FAT12 chain. */
 .L_dos_delete:
     mov ax, word ptr ss:[bp + 14]
     mov es, ax
     mov si, word ptr ss:[bp + 6]
     call filename_from_es_si
     jc .L_open_not_found
+    cmp byte ptr [path_directory_only], 0
+    jne .L_open_not_found
     call find_file
     jc .L_open_not_found
+    test byte ptr [file_attributes], 0x10
+    jnz .L_open_denied
     test byte ptr [file_attributes], 1
     jnz .L_open_denied
     call root_is_open
     jc .L_open_denied
     call free_file_chain
     jc .L_write_failure
-    mov ax, ROOT_SEG
-    mov es, ax
+    call select_directory
+    jc .L_write_failure
     mov di, word ptr [file_dir_offset]
     mov byte ptr es:[di], 0xe5
-    mov byte ptr [fs_dirty], 1
+    call flush_directory
+    jc .L_write_failure
     call flush_metadata
     jc .L_write_failure
     xor ax, ax
@@ -1632,6 +1928,322 @@ int21_handler:
     pop ds
     iret
 
+/* Directory operations share the path resolver and 8.3 FAT12 entries.
+ * A directory owns exactly one cluster (16 entries including . and ..).
+ * AX returns a DOS error on CF=1, otherwise CF=0.
+ */
+dos_mkdir:
+    call filename_from_es_si
+    jc .L_mkdir_bad_path
+    cmp byte ptr [path_directory_only], 0
+    jne .L_mkdir_bad_path
+    call find_file
+    jnc .L_mkdir_exists
+    call find_free_root
+    jc .L_mkdir_disk_full
+    call allocate_cluster
+    jc .L_mkdir_disk_full
+    mov word ptr [new_dir_cluster], ax
+    /* Persist the cluster allocation before publishing a directory entry. */
+    call flush_metadata
+    jc .L_mkdir_write_fault
+    /* Write a zero-initialized directory cluster with the mandatory dots. */
+    push es
+    mov ax, DIR_SEG
+    mov es, ax
+    xor di, di
+    xor ax, ax
+    mov cx, 256
+    rep stosw
+    mov byte ptr es:[0], '.'
+    mov byte ptr es:[32], '.'
+    mov byte ptr es:[33], '.'
+    mov di, 1
+    mov cx, 10
+    mov al, ' '
+    rep stosb
+    mov di, 34
+    mov cx, 9
+    rep stosb
+    mov byte ptr es:[11], 0x10
+    mov byte ptr es:[32 + 11], 0x10
+    mov ax, word ptr [new_dir_cluster]
+    mov word ptr es:[26], ax
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr es:[32 + 26], ax
+    mov ax, word ptr [new_dir_cluster]
+    add ax, DATA_BIAS
+    xor bx, bx
+    call write_sector
+    pop es
+    jc .L_mkdir_write_fault
+    /* Re-select containing directory (DIR_SEG may have been overwritten). */
+    call select_directory
+    jc .L_mkdir_write_fault
+    mov di, word ptr [file_dir_offset]
+    push di
+    xor ax, ax
+    mov cx, 16
+    rep stosw
+    pop di
+    mov si, offset filename
+    mov cx, 11
+.L_mkdir_copy_name:
+    mov al, byte ptr [si]
+    mov byte ptr es:[di], al
+    inc di
+    inc si
+    loop .L_mkdir_copy_name
+    mov byte ptr es:[di], 0x10
+    mov ax, word ptr [new_dir_cluster]
+    mov word ptr es:[di + 15], ax /* di now entry+11, FAT first cluster +26 */
+    call flush_directory
+    jc .L_mkdir_write_fault
+    call flush_metadata
+    jc .L_mkdir_write_fault
+    clc
+    ret
+.L_mkdir_exists:
+    mov ax, 5
+    stc
+    ret
+.L_mkdir_disk_full:
+    mov ax, 39
+    stc
+    ret
+.L_mkdir_bad_path:
+    mov ax, 3
+    stc
+    ret
+.L_mkdir_write_fault:
+    mov ax, 29
+    stc
+    ret
+
+dos_rmdir:
+    call filename_from_es_si
+    jc .L_rmdir_bad
+    cmp byte ptr [path_directory_only], 0
+    jne .L_rmdir_bad
+    call find_directory
+    jc .L_rmdir_bad
+    mov ax, word ptr [file_cluster]
+    mov word ptr [new_dir_cluster], ax
+    /* Do not claim a multi-cluster directory is empty when only its
+     * first cluster was inspected. We don't traverse these until later. */
+    call fat_next
+    cmp ax, 0x0ff8
+    jb .L_rmdir_access
+    mov ax, word ptr [new_dir_cluster]
+    /* Never remove the cwd or any ancestor of it. */
+    mov cl, byte ptr [cwd_depth]
+    xor ch, ch
+    mov si, offset cwd_stack
+.L_rmdir_ancestor:
+    jcxz .L_rmdir_check_empty
+    cmp word ptr [si], ax
+    je .L_rmdir_access
+    add si, 2
+    loop .L_rmdir_ancestor
+.L_rmdir_check_empty:
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr [saved_parent_cluster], ax
+    mov ax, word ptr [new_dir_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    call select_directory
+    jc .L_rmdir_disk_error
+    xor di, di
+.L_rmdir_scan:
+    cmp byte ptr es:[di], 0
+    je .L_rmdir_is_empty
+    cmp byte ptr es:[di], 0xe5
+    je .L_rmdir_next
+    /* Only the first two standard DOS dot entries may be skipped. */
+    cmp di, 32
+    ja .L_rmdir_not_empty
+    cmp byte ptr es:[di], '.'
+    jne .L_rmdir_not_empty
+.L_rmdir_next:
+    add di, 32
+    loop .L_rmdir_scan
+.L_rmdir_is_empty:
+    mov ax, word ptr [saved_parent_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    mov ax, word ptr [new_dir_cluster]
+    mov word ptr [file_cluster], ax
+    call free_file_chain
+    jc .L_rmdir_disk_error
+    call select_directory
+    jc .L_rmdir_disk_error
+    mov di, word ptr [file_dir_offset]
+    mov byte ptr es:[di], 0xe5
+    call flush_directory
+    jc .L_rmdir_disk_error
+    call flush_metadata
+    jc .L_rmdir_disk_error
+    clc
+    ret
+.L_rmdir_not_empty:
+    mov ax, word ptr [saved_parent_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    mov ax, 5
+    stc
+    ret
+.L_rmdir_disk_error:
+    mov ax, word ptr [saved_parent_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    mov ax, 29
+    stc
+    ret
+.L_rmdir_bad:
+    mov ax, 3
+    stc
+    ret
+.L_rmdir_access:
+    mov ax, 5
+    stc
+    ret
+
+dos_chdir:
+    call filename_from_es_si
+    jc .L_chdir_bad
+    cmp byte ptr [path_directory_only], 0
+    jne .L_chdir_commit
+    call find_directory
+    jc .L_chdir_bad
+    cmp byte ptr [path_depth], 8
+    jae .L_chdir_bad
+    mov bl, byte ptr [path_depth]
+    xor bh, bh
+    shl bx, 1
+    mov ax, word ptr [file_cluster]
+    mov word ptr [path_stack + bx], ax
+    mov word ptr [dir_parent_cluster], ax
+    inc byte ptr [path_depth]
+.L_chdir_commit:
+    mov al, byte ptr [path_depth]
+    mov byte ptr [cwd_depth], al
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr [cwd_cluster], ax
+    mov cx, 8
+    mov si, offset path_stack
+    mov di, offset cwd_stack
+.L_chdir_copy:
+    mov ax, word ptr [si]
+    mov word ptr [di], ax
+    add si, 2
+    add di, 2
+    loop .L_chdir_copy
+    call rebuild_cwd
+    clc
+    ret
+.L_chdir_bad:
+    mov ax, 3
+    stc
+    ret
+
+/* Reconstruct relative DOS CWD from cluster ancestry for AH=47h and shell.
+ * Output is empty for root; otherwise NAME\\CHILD (no leading slash).
+ * Names are found in each parent directory by the child's cluster number.
+ */
+rebuild_cwd:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    xor bx, bx                   /* depth index */
+    mov di, offset cwd_text
+.L_cwd_next_level:
+    cmp bl, byte ptr [cwd_depth]
+    jae .L_cwd_done
+    test bx, bx
+    jz .L_cwd_parent_root
+    mov si, bx
+    shl si, 1
+    mov ax, word ptr [cwd_stack + si - 2]
+    jmp .L_cwd_select
+.L_cwd_parent_root:
+    xor ax, ax
+.L_cwd_select:
+    mov word ptr [dir_parent_cluster], ax
+    call select_directory
+    jc .L_cwd_done
+    mov si, bx
+    shl si, 1
+    mov dx, word ptr [cwd_stack + si]
+    xor si, si
+.L_cwd_find:
+    cmp byte ptr es:[si], 0
+    je .L_cwd_done
+    cmp byte ptr es:[si], 0xe5
+    je .L_cwd_skip
+    test byte ptr es:[si + 11], 0x10
+    jz .L_cwd_skip
+    cmp byte ptr es:[si], '.'
+    je .L_cwd_skip
+    cmp word ptr es:[si + 26], dx
+    je .L_cwd_found
+.L_cwd_skip:
+    add si, 32
+    loop .L_cwd_find
+    jmp .L_cwd_done
+.L_cwd_found:
+    test bx, bx
+    jz .L_cwd_no_separator
+    mov byte ptr [di], '\\'
+    inc di
+.L_cwd_no_separator:
+    xor ax, ax
+.L_cwd_base:
+    cmp al, 8
+    jae .L_cwd_extension
+    push bx
+    mov bx, ax
+    mov dl, byte ptr es:[si + bx]
+    pop bx
+    cmp dl, ' '
+    je .L_cwd_base_next
+    mov byte ptr [di], dl
+    inc di
+.L_cwd_base_next:
+    inc al
+    jmp .L_cwd_base
+.L_cwd_extension:
+    cmp byte ptr es:[si + 8], ' '
+    je .L_cwd_level_done
+    mov byte ptr [di], '.'
+    inc di
+    mov ax, 8
+.L_cwd_ext:
+    push bx
+    mov bx, ax
+    mov dl, byte ptr es:[si + bx]
+    pop bx
+    cmp dl, ' '
+    je .L_cwd_ext_next
+    mov byte ptr [di], dl
+    inc di
+.L_cwd_ext_next:
+    inc ax
+    cmp ax, 11
+    jb .L_cwd_ext
+.L_cwd_level_done:
+    inc bx
+    jmp .L_cwd_next_level
+.L_cwd_done:
+    mov byte ptr [di], 0
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 /* Find first unused DOS handle. Returns SI=record and DX=5..8, CF clear;
  * all other registers preserved. */
 find_handle_slot:
@@ -1664,18 +2276,19 @@ fill_handle:
     mov word ptr [si + 10], ax
     mov ax, word ptr [file_dir_offset]
     mov word ptr [si + 12], ax
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr [si + 14], ax
     ret
 
-/* Locate a free 32-byte root-directory slot. No subdirectories. */
+/* Locate a free 32-byte slot in selected directory. */
 find_free_root:
     push ax
     push cx
     push di
     push es
-    mov ax, ROOT_SEG
-    mov es, ax
+    call select_directory
+    jc .L_ffr_failed
     xor di, di
-    mov cx, ROOT_ENTRIES
 .L_ffr_loop:
     cmp byte ptr es:[di], 0
     je .L_ffr_found
@@ -1683,6 +2296,7 @@ find_free_root:
     je .L_ffr_found
     add di, 32
     loop .L_ffr_loop
+.L_ffr_failed:
     stc
     jmp .L_ffr_exit
 .L_ffr_found:
@@ -1707,7 +2321,11 @@ root_is_open:
     cmp byte ptr [bx], 0
     je .L_rio_next
     cmp word ptr [bx + 12], ax
+    jne .L_rio_next
+    mov ax, word ptr [dir_parent_cluster]
+    cmp word ptr [bx + 14], ax
     je .L_rio_busy
+    mov ax, word ptr [file_dir_offset]
 .L_rio_next:
     add bx, 16
     loop .L_rio_loop
@@ -1891,18 +2509,22 @@ flush_metadata:
     pop ax
     ret
 
-/* A writable handle owns its in-memory root entry size/first cluster.
- * Called after write and before close. Preserves all registers. */
+/* Update a handle's containing directory entry; not only FAT root. */
 update_root_handle:
     push ax
+    push cx
     push di
     push es
     cmp byte ptr [bx], 0
     je .L_urh_done
     cmp byte ptr [bx + 1], 0
     je .L_urh_done
-    mov ax, ROOT_SEG
-    mov es, ax
+    mov ax, word ptr [dir_parent_cluster]
+    push ax
+    mov ax, word ptr [bx + 14]
+    mov word ptr [dir_parent_cluster], ax
+    call select_directory
+    jc .L_urh_restore
     mov di, word ptr [bx + 12]
     mov ax, word ptr [bx + 2]
     mov word ptr es:[di + 26], ax
@@ -1910,10 +2532,14 @@ update_root_handle:
     mov word ptr es:[di + 28], ax
     mov ax, word ptr [bx + 10]
     mov word ptr es:[di + 30], ax
-    mov byte ptr [fs_dirty], 1
+    call flush_directory
+.L_urh_restore:
+    pop ax
+    mov word ptr [dir_parent_cluster], ax
 .L_urh_done:
     pop es
     pop di
+    pop cx
     pop ax
     ret
 
@@ -2233,16 +2859,31 @@ file_cluster:       .word 0
 file_size:          .word 0
 file_size_high:     .word 0
 filename:           .space 11
+.align 2
+dir_parent_cluster: .word 0
+cwd_cluster:        .word 0
+cwd_depth:          .byte 0
+path_depth:         .byte 0
+path_directory_only:.byte 0
+.align 2
+cwd_stack:          .space 16
+path_stack:         .space 16
+cwd_text:           .space 128
+new_dir_cluster:    .word 0
+saved_parent_cluster:.word 0
+
 cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.3.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
-prompt:             .asciz "\r\nA:\\>"
+banner:             .asciz "\r\nVelvetDOS 0.4.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
 cmd_ver:            .asciz "VER"
 cmd_cls:            .asciz "CLS"
 cmd_reboot:         .asciz "REBOOT"
-help_text:          .asciz "Commands: HELP, DIR, VER, CLS, REBOOT\r\nRun root .COM or small MZ .EXE programs by name.\r\nFAT12 root 8.3 file writes and subset of INT 21h supported.\r\n"
-dir_header:         .asciz "Root directory:\r\n"
+help_text:          .asciz "Commands: HELP, DIR, CD, MD, RD, VER, CLS, REBOOT\r\nRun local .COM or small MZ .EXE programs by name.\r\nFAT12 single-cluster directories, 8.3 paths and DOS file API.\r\n"
+dir_header:         .asciz "Directory:\r\n"
+dir_marker:         .asciz "  <DIR>"
+dir_error_message:  .asciz "Directory operation failed.\r\n"
 bad_command_message:.asciz "Bad command or file name.\r\n"
 load_error_message: .asciz "Unable to load DOS program (format, size or disk error).\r\n"
 disk_error_message: .asciz "FATAL: Cannot read floppy disk.\r\n"

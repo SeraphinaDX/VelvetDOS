@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.3.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.4.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.3.0", kernel)
+        self.assertIn(b"VelvetDOS 0.4.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -121,6 +121,45 @@ class FloppyTest(unittest.TestCase):
             self.assertIn(routine, source)
         self.assertIn("mov ax, 0x0301", source)
         self.assertIn("mov si, 74", source)  # FAT mirror
+
+    def test_nested_paths_dos_program_is_in_image(self):
+        program = (BIN / "PATHS.COM").read_bytes()
+        for marker in (b"PATHS.COM:", b"LAB\\ONE", b"A:\\LAB\\ONE\\TEST.DAT", b"TEST.DAT"):
+            self.assertIn(marker, program)
+        for fn in (0x39, 0x3a, 0x3b, 0x47, 0x3c, 0x40, 0x41):
+            self.assertIn(bytes([0xb4, fn]), program)  # MOV AH, immediate
+
+    def test_directory_syscalls_use_cluster_based_storage(self):
+        src = (ROOT / "kernel" / "kernel.s").read_text()
+        for marker in ("dos_mkdir:", "dos_rmdir:", "dos_chdir:",
+                       "rebuild_cwd:", "filename_from_es_si:",
+                       "select_directory:", "flush_directory:",
+                       "find_directory:", "cwd_stack:", "path_stack:"):
+            self.assertIn(marker, src)
+        # 16 entries including '.' and '..'; guard max path depth.
+        self.assertIn("mov cx, 16", src)
+        self.assertIn("cmp byte ptr [path_depth], 8", src)
+
+    def test_path_parser_compiles_real_backslash_checks(self):
+        """GAS treats a single backslash char literal as apostrophe (0x27).
+
+        Catch the exact 0.4.0 bug where LAB\ONE was created as one FAT name.
+        Check both the source syntax and the assembled 8086 instructions.
+        """
+        import re
+        import subprocess
+        src = (ROOT / "kernel" / "kernel.s").read_text()
+        self.assertEqual(src.count("cmp al, 0x5c"), 4)
+        self.assertNotIn("cmp al, '" + chr(92) + "'", src)
+        disasm = subprocess.check_output(
+            ["objdump", "-d", "-M", "intel,i8086", str(BIN / "kernel.o")],
+            text=True,
+        )
+        resolver = disasm.split("<filename_from_es_si>:", 1)[1].split(
+            "<select_directory>:", 1
+        )[0]
+        self.assertEqual(len(re.findall(r"\bcmp\s+al,0x5c\b", resolver)), 4)
+        self.assertNotRegex(resolver, r"\bcmp\s+al,0x27\b")
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):
