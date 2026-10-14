@@ -10,11 +10,12 @@ optional 32-bit Free Pascal programs are future work. All code: GPLv3-only.
 - [x] 0.4.0 — Directory navigation and 8.3 DOS path resolution (86Box verified)
 - [x] 0.5.0 — Find First/Next, attributes, timestamps, DTA, free space (86Box verified)
 - [x] 0.6.0 — Bounded FAT12 directory growth (86Box verified)
-- [ ] 0.7.0 — PSP argument tail, environment, current PSP query, exit code
+- [x] 0.7.0 — PSP argument tail, environment, current PSP query, exit code
+      (86Box verified)
+- [ ] 0.8.0 — Standalone COMMAND.COM, single-child COM EXEC and PSP parent
       (built + offline tests passed; awaiting 86Box verification)
-- [ ] 0.8.0+ — Introduce standalone command interpreter, broaden DOS APIs,
-      process environment management, AH=4Bh EXEC, documented MZ loading
-      and independent third-party DOS application tests
+- [ ] 0.9.0+ — MZ child EXEC, generalized DOS memory ownership, command
+      environment management, batch files and third-party DOS programs
 - [ ] Later — FAT error recovery, traditional device drivers, FAT16, 386
       protected mode, DPMI/GO32v2, optional 32-bit Free Pascal and self-hosting
 

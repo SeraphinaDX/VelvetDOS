@@ -29,7 +29,7 @@ _start:
     jne failed
     cmp word ptr [2], 0x9000 /* exclusive segment of allocation */
     jne failed
-    cmp word ptr [0x16], 0
+    cmp word ptr [0x16], 0x3000
     jne failed
 
     mov word ptr [stage], offset msg_dta

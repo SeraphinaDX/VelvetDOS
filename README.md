@@ -1,107 +1,132 @@
-# VelvetDOS 0.7.0 — Program compatibility preview
+# VelvetDOS 0.8.0 — Standalone COMMAND.COM preview
 
-VelvetDOS is an experimental **8086 real-mode DOS-compatible operating system**
-under GNU **GPLv3-only**. This release builds on the 0.6.0 source that was
-validated in 86Box by the project owner. It adds a real DOS-style PSP command
-tail and a minimal process environment so native DOS programs can inspect
-arguments and startup information.
+VelvetDOS is an experimental **GNU GPLv3-only, 8086 real-mode DOS-compatible
+operating system**, currently using GNU `as` and `ld` for assembly. Version
+0.8.0 introduces a genuine, separately assembled **`COMMAND.COM`** and an
+initial synchronous DOS `EXEC` service (`INT 21h AH=4B00`). This is still
+**pre-alpha**, not a general replacement for MS-DOS or FreeDOS.
 
-> **Development preview:** Builds and offline tests pass, but **0.7.0 has not
-> yet been boot-tested in 86Box**. Use disposable disk images, not real data.
+The project has no Pascal or 386 protected-mode dependencies. The core is
+still 8086-compatible; 386/DPMI and 32-bit Free Pascal are later milestones.
 
-## Added in 0.7.0
+## What's new in 0.8.0
 
-- The internal shell accepts arguments after a `.COM` or small MZ `.EXE` name.
-  The executable name is normalized to uppercase for FAT12 lookup, while the
-  tail's original case and whitespace are preserved.
-- A DOS-compatible command tail is passed in the PSP at offset `80h`: one
-  length byte, the tail starting at `81h`, then a carriage return (`0Dh`).
-  `INT 21h AH=2Fh` still reports the default DTA at `PSP:0080h`.
-- The PSP now has pointers to the startup interrupt vectors, a placeholder
-  parent segment (`0`), a conventional default handle table, and two blank
-  default FCB name fields. DOS handle inheritance is not yet implemented.
-- `PSP:002Ch` points to a read-only bootstrap environment below the program
-  allocation area. It contains `PATH=A:\`, `PROMPT=$P$G` and an extended
-  program-name string. `SET` / per-process mutable environments remain future work.
-- `INT 21h AH=51h` and `62h` return the current PSP segment in `BX`.
-- `INT 21h AH=4Ch` records the application's `AL` exit code; `INT 20h` and
-  `AH=00h` record zero. `AH=4Dh` has a minimal one-shot return-code query,
-  but no parent process or nested EXEC handling yet.
-- `STATUS`, a temporary VelvetDOS shell diagnostic, displays the last exit
-  status in hexadecimal.
-- New public-API DOS test programs: `PSPTEST.COM` and `EXITTEST.COM`.
+- `COMMAND.COM` is a separately linked real-mode `.COM` program on the FAT12
+  floppy. The kernel finds and launches it during boot instead of displaying
+  the old built-in shell by default.
+- The built-in kernel shell remains an emergency fallback if `COMMAND.COM`
+  cannot be loaded or if it exits with `EXIT`.
+- The command interpreter uses DOS interrupts to handle `HELP`, `VER`, `CLS`,
+  `DIR`, `CD`, `MD`, `RD`, `STATUS`, `REBOOT`, and `EXIT`.
+- `INT 21h AH=4B00` loads **one** external `.COM` child synchronously in a
+  separate segment. The parent `COMMAND.COM` remains resident and resumes
+  when the child calls `INT 20h` or `INT 21h AH=4Ch`.
+- Child PSP has a conventional parent pointer, PSP, environment pointer,
+  command-line arguments, and its own default DTA. The parent's DTA,
+  interrupt frame, and conventional-memory allocation boundary are restored
+  when the child exits. `AH=4Dh` returns the child exit code.
+- `EXECCHK.COM` tests rejection of nested `EXEC` and child PSP reporting.
+  Earlier regression binaries are retained.
 
-No Free Pascal, DPMI, or protected-mode code has been added.
+**Current supported EXEC subset:** `AH=4B, AL=00`, `.COM` file with an explicit
+8.3 extension, caller's environment selected using parameter block word zero,
+command-tail pointer at `ES:BX+2/+4`. This is not yet general DOS process
+management; it supports a single resident `COMMAND.COM` and a single child.
 
-## Build from source on Linux
+## Build
 
-Requires GNU Make, GNU binutils (`as`, `ld`, `objdump` for one regression), and
-Python 3. QEMU is optional.
+Requires `make`, GNU `as`/`ld` from binutils, and Python 3. QEMU is optional.
+86Box can boot the `.img` directly.
 
 ```sh
 make clean test
-make run                  # if QEMU is installed
+make run         # requires qemu-system-i386
 ```
 
-The 1.44 MB image is `build/velvetdos-0.7.0.img`. Copy this image before
-using it as a writable floppy in **86Box**.
+The image is `build/velvetdos-0.8.0.img` (1.44 MB, FAT12). It contains both
+`KERNEL` in reserved sectors and normal filesystem files including
+`COMMAND.COM`, `HELLO.COM`, and all the regression binaries.
 
-## 86Box acceptance testing
+## Test in 86Box
 
-Boot **a fresh writable image** and enter these commands exactly (the mixed
-case matters for verifying the command tail):
+Boot a **fresh, writable copy** of the image and confirm the interpreter
+prints `VelvetDOS COMMAND.COM 0.8.0` before the `A:\>` prompt.
 
 ```text
-A:\>VER
-A:\>PSPTEST hello MiXeD 123
-A:\>STATUS
-A:\>EXITTEST
-A:\>STATUS
-A:\>HELLO
-A:\>EXEDEMO
-A:\>FINDTEST
-A:\>VLIST
+VER
+DIR
+HELLO
+HELLO.COM
+PSPTEST hello MiXeD 123
+STATUS
+EXITTEST
+STATUS
+EXECCHK
+STATUS
+FINDTEST
+VLIST
+MEMORY
 ```
 
-Expected messages:
+Expected highlights:
+
+- `HELLO` and `HELLO.COM` each print the existing 16-bit message and **return
+  to the `COMMAND.COM` prompt**; multiple launches should work consecutively.
+- `PSPTEST hello MiXeD 123` reports PASS, including verifying that its PSP
+  parent points to resident COMMAND.COM at segment `3000h`.
+- `EXITTEST` reports a return value of `2A` hex; subsequent `STATUS` prints
+  `2A` (the value is consumed when queried).
+- `EXECCHK` prints `nested EXEC rejected, child PSP PASS!`. A following
+  `STATUS` prints `00`.
+- `FINDTEST`, `VLIST`, and `MEMORY` should continue working through DOS EXEC.
+
+For destructive directory/file regressions use another fresh writable floppy:
 
 ```text
-PSPTEST.COM: command tail, PSP, DTA, handles, environment PASS!
-Last program exit code (hex): 00
-EXITTEST.COM: returning code 2A hex (42 decimal).
-Last program exit code (hex): 2A
+PATHS
+DIRGROW
+WRITE
+APPEND
+RECHECK
 ```
 
-`PSPTEST` will print `PSPTEST.COM failed at: <stage>` if an API check fails.
-When `STATUS` is invoked after that failure, the expected hexadecimal code is
-`01`. Test `DIRGROW`, `PATHS` and `WRITE/APPEND/RECHECK/DELETE` on separate
-fresh writable images because they manipulate on-disk files and directories.
+For the previously supported restricted **MZ `.EXE` test**, type `EXIT` to
+leave the standalone interpreter for the recovery kernel shell, then run
+`EXEDEMO` there. Running MZ children from `COMMAND.COM` is **not** supported
+by the first `EXEC` implementation.
 
-## Important limitations
+## Known limits and cautions
 
-- This is **not a full MS-DOS-compatible environment**: no standalone
-  `COMMAND.COM`, batch processing, `AH=4Bh` EXEC, process nesting, environment
-  mutation, conventional handle inheritance, shell variable expansion,
-  pipelines, redirection or quoting rules. PSP vectors are copied but no
-  full termination/break handler mechanism is implemented.
-- The shell accepts a single 8.3 command token and a raw argument tail. It
-  does not understand quoted executable paths or search `PATH` for programs.
-  The command-line input limit is **120 characters** total.
-- `AH=4Dh` reflects the last terminated program, not a real parent's child
-  process status. The `STATUS` shell command is non-standard and diagnostic.
-- Subdirectories are limited to 8 FAT12 clusters; FAT12 writes are not
-  crash-safe. Only 1.44 MB floppy geometry and limited `.COM`/MZ loading.
-- Kernel and C library DOS API coverage remains incomplete; hardware-specific
-  games and 32-bit DOS extenders are unsupported.
+- **Do not use on valuable disks or real hardware.** FAT metadata writes are
+  not transactional and can corrupt an interrupted disk image.
+- Only **one** child `.COM` process at once. Nested `EXEC` fails with DOS error
+  8. MZ `.EXE` child EXEC, shell PATH searching, batch files, pipes,
+  redirection, shell environment editing, TSRs, file handle inheritance,
+  and full DOS executable memory/ownership semantics are not implemented.
+- Parent segment is fixed at `3000h`, child at `5000h`. This is a staging
+  solution, not a production DOS memory allocator. Some programs that expect
+  a full conventional-memory allocation or inherited open files can fail.
+- The new COMMAND.COM handles only one argument string for `CD`/`MD`/`RD`,
+  and only single-part 8.3 program names (no wildcard executable lookup).
+- The old emergency shell remains part of the kernel in this version and
+  still supports the restricted MZ loader. It has not been removed yet.
+- Structural tests check boot image layout, generated binaries and source
+  contracts. They **do not substitute for 86Box runtime tests**. Runtime
+  execution of 0.8.0 has not been verified here.
 
-## Project layout and license
+## Directory structure
 
-- `boot/` — 8086 bootloader
-- `kernel/` — real-mode kernel, DOS INT 21h handler and FAT12 driver
-- `programs/` — standalone DOS API regression programs
-- `tools/` — host-side FAT12 image generator and minimal MZ fixture creator
-- `tests/` — offline integrity and static compatibility regression checks
-- `docs/ROADMAP.md` — milestone roadmap
+- `boot/` — real-mode FAT12 floppy boot sector
+- `kernel/kernel.s` — DOS interrupts, filesystem, PSP, and first EXEC path
+- `programs/command.s` — standalone `COMMAND.COM` shell
+- `programs/execchk.s` — nested EXEC regression
+- `programs/*.s` — other DOS regression programs
+- `tools/` — floppy image and minimal MZ format build tools
+- `tests/` — host-side image integrity tests
+- `docs/ROADMAP.md` — roadmap
 
-All original VelvetDOS source code is **GNU GPL version 3 only** (`COPYING`,
-SPDX `GPL-3.0-only`). No Microsoft or FreeDOS kernel code was copied.
+## Licensing
+
+All original VelvetDOS source files are licensed under **GNU GPL version 3
+only**, identified by `SPDX-License-Identifier: GPL-3.0-only` in their headers.
+See `COPYING`. No Microsoft/FreeDOS source code is included.

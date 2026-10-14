@@ -1,7 +1,8 @@
-/* VelvetDOS 0.7.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.8.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
- * FAT12 root and bounded multi-cluster subdirectories (8.3); one DOS application at a time.
+ * FAT12 root and bounded multi-cluster directories (8.3); one resident shell
+ * with a single non-nesting COM child, no multi-tasking.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -16,6 +17,8 @@
 .equ MEM_LIMIT,      0x9000
 .equ MEM_MCB,        0x2fff
 .equ APP_SEG,        0x3000
+.equ CHILD_SEG,      0x5000
+.equ CHILD_MCB,      0x4fff
 .equ ENV_SEG,        0x2a00  /* read-only bootstrap environment below MEM_MCB */
 .equ ROOT_SECTOR,    83
 .equ FAT_SECTOR,     65
@@ -31,6 +34,7 @@ _start:
     mov es, ax
     mov ss, ax
     mov sp, offset stack_end
+    cld
     sti
     mov byte ptr [boot_drive], dl
     /* Install INT 20h and INT 21h in the real-mode IVT. */
@@ -46,6 +50,24 @@ _start:
     call load_tables
     call init_environment
     mov si, offset banner
+    call print_z
+    /* Boot the DOS command interpreter as a genuine resident .COM process.
+     * The former embedded shell remains an emergency recovery prompt. */
+    mov word ptr [dir_parent_cluster], 0
+    mov si, offset command_filename
+    mov di, offset filename
+    mov cx, 11
+    rep movsb
+    call find_file
+    jc shell_start_failed
+    test byte ptr [file_attributes], 0x10
+    jnz shell_start_failed
+    call load_com
+    jc shell_start_failed
+    mov byte ptr [cmdtail_len], 0
+    call start_com
+shell_start_failed:
+    mov si, offset shell_failed_message
     call print_z
 shell_loop:
     mov ax, cs
@@ -560,7 +582,7 @@ load_com:
     shr ax, cl
     mov cx, ax
     mov dx, word ptr [file_cluster]
-    mov ax, APP_SEG
+    mov ax, word ptr [exec_load_segment]
     mov es, ax
     mov bx, 0x0100
     test cx, cx
@@ -797,7 +819,7 @@ make_psp:
     push si
     push di
     push es
-    mov ax, APP_SEG
+    mov ax, word ptr [current_psp]
     mov es, ax
     xor di, di
     xor ax, ax
@@ -811,7 +833,7 @@ make_psp:
     mov es, ax
     mov ax, word ptr es:[0x22 * 4]
     mov bx, word ptr es:[0x22 * 4 + 2]
-    mov cx, APP_SEG
+    mov cx, word ptr [current_psp]
     mov es, cx
     mov word ptr es:[0x0a], ax
     mov word ptr es:[0x0c], bx
@@ -819,7 +841,7 @@ make_psp:
     mov es, ax
     mov ax, word ptr es:[0x23 * 4]
     mov bx, word ptr es:[0x23 * 4 + 2]
-    mov cx, APP_SEG
+    mov cx, word ptr [current_psp]
     mov es, cx
     mov word ptr es:[0x0e], ax
     mov word ptr es:[0x10], bx
@@ -827,12 +849,13 @@ make_psp:
     mov es, ax
     mov ax, word ptr es:[0x24 * 4]
     mov bx, word ptr es:[0x24 * 4 + 2]
-    mov cx, APP_SEG
+    mov cx, word ptr [current_psp]
     mov es, cx
     mov word ptr es:[0x12], ax
     mov word ptr es:[0x14], bx
-    /* No separate COMMAND.COM process exists yet, so parent is zero. */
-    mov word ptr es:[0x16], 0
+    /* Conventional PSP parent pointer: zero for primary shell. */
+    mov ax, word ptr [psp_parent]
+    mov word ptr es:[0x16], ax
     mov word ptr es:[0x2c], ENV_SEG
     /* Standard inherited handle table (0..4; 5..19 unused). */
     mov di, 0x18
@@ -861,7 +884,8 @@ make_psp:
     mov di, 0x81
     rep movsb
     mov byte ptr es:[di], 13
-    mov word ptr [dta_seg], APP_SEG
+    mov ax, word ptr [current_psp]
+    mov word ptr [dta_seg], ax
     mov word ptr [dta_off], 0x80
     pop es
     pop di
@@ -1422,6 +1446,36 @@ process_exit:
     mov sp, offset stack_end
     sti
     call close_all_handles
+    cmp byte ptr [exec_active], 0
+    je .L_exit_to_recovery_shell
+    /* A child exited. Rebuild the resident shell's conventional-memory MCB,
+     * restore its DTA and INT 21h frame, and resume the suspended caller.
+     * Only one child is permitted in this 0.8.0 preview. */
+    mov ax, MEM_MCB
+    mov es, ax
+    mov byte ptr es:[0], 'Z'
+    mov word ptr es:[1], APP_SEG
+    mov word ptr es:[3], MEM_LIMIT - APP_SEG
+    mov ax, APP_SEG
+    mov es, ax
+    mov word ptr es:[2], MEM_LIMIT
+    mov word ptr [current_psp], APP_SEG
+    mov word ptr [exec_load_segment], APP_SEG
+    mov word ptr [psp_parent], 0
+    mov byte ptr [exec_active], 0
+    mov ax, word ptr [exec_parent_dta_seg]
+    mov word ptr [dta_seg], ax
+    mov ax, word ptr [exec_parent_dta_off]
+    mov word ptr [dta_off], ax
+    mov ax, word ptr [exec_parent_ss]
+    mov bx, word ptr [exec_parent_sp]
+    cli
+    mov ss, ax
+    mov sp, bx
+    mov bp, bx
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_exit_to_recovery_shell:
     jmp shell_loop
 
 /* Minimal, deliberate subset of MS-DOS INT 21h. Unimplemented AH -> CF, AX=1.
@@ -1443,6 +1497,7 @@ int21_handler:
     push di
     push bp
     mov bp, sp
+    cld  /* kernel string instructions require forward direction; IRET restores caller FLAGS */
     mov bx, cs
     mov ds, bx
     and word ptr ss:[bp + 20], 0xfffe /* clear carry */
@@ -1504,6 +1559,8 @@ int21_handler:
     je .L_dos_resize
     cmp ah, 0x40
     je .L_int21_handler_write_handle
+    cmp ah, 0x4b
+    je .L_dos_exec
     cmp ah, 0x4d
     je .L_int21_handler_return_code
     cmp ah, 0x51
@@ -2179,6 +2236,128 @@ int21_handler:
     or word ptr ss:[bp + 20], 1
     jmp .L_int21_handler_return
 
+/* DOS EXEC (AH=4B00) — one suspended parent plus one 16-bit .COM child.
+ * DS:DX is an 8.3 DOS path; ES:BX points to the DOS EXEC parameter block.
+ * Only the command tail pointer at offsets +2/+4 is read, and a zero
+ * environment segment inherits the fixed bootstrap environment. Errors
+ * return through the parent INT 21h frame, success resumes after child exit.
+ * No nested EXEC, .EXE child, handle inheritance, or arbitrary allocation yet.
+ */
+.L_dos_exec:
+    cmp al, 0
+    jne .L_exec_bad_function
+    cmp byte ptr [exec_active], 0
+    jne .L_exec_no_memory
+    /* Interpret the filename from the calling process's DS:DX. */
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call filename_from_es_si
+    jc .L_exec_not_found
+    cmp byte ptr [path_directory_only], 0
+    jne .L_exec_not_found
+    /* A loader for general MZ files and multiple resident children comes
+     * later. Explicit .COM filenames are required for this first step. */
+    cmp byte ptr [filename + 8], 'C'
+    jne .L_exec_bad_format
+    cmp byte ptr [filename + 9], 'O'
+    jne .L_exec_bad_format
+    cmp byte ptr [filename + 10], 'M'
+    jne .L_exec_bad_format
+    call find_file
+    jc .L_exec_not_found
+    test byte ptr [file_attributes], 0x10
+    jnz .L_exec_bad_format
+    /* The user's DOS command tail is length-prefixed, not ASCIIZ. */
+    mov ax, word ptr ss:[bp + 12]
+    mov es, ax
+    mov bx, word ptr ss:[bp + 10]
+    cmp word ptr es:[bx], 0    /* inherit environment only */
+    jne .L_exec_bad_function
+    mov di, word ptr es:[bx + 2]
+    mov ax, word ptr es:[bx + 4]
+    test ax, ax
+    jz .L_exec_bad_function
+    mov es, ax
+    mov cl, byte ptr es:[di]
+    cmp cl, 126
+    ja .L_exec_bad_function
+    xor ch, ch
+    mov byte ptr [cmdtail_len], cl
+    mov si, offset cmdtail
+    push cx
+.L_exec_tail_copy:
+    test cx, cx
+    jz .L_exec_tail_end
+    mov al, byte ptr es:[di + 1]
+    mov byte ptr [si], al
+    inc si
+    inc di
+    dec cx
+    jmp .L_exec_tail_copy
+.L_exec_tail_end:
+    mov byte ptr [si], 0
+    pop cx
+    /* No parent memory is overwritten: the resident COMMAND.COM stays at
+     * 3000h while this .COM child loads at 5000h. */
+    mov word ptr [exec_load_segment], CHILD_SEG
+    call load_com
+    jc .L_exec_load_failed
+    mov ax, word ptr [dta_seg]
+    mov word ptr [exec_parent_dta_seg], ax
+    mov ax, word ptr [dta_off]
+    mov word ptr [exec_parent_dta_off], ax
+    mov ax, ss
+    mov word ptr [exec_parent_ss], ax
+    mov word ptr [exec_parent_sp], bp
+    /* Construct a minimal, valid two-block MCB chain. */
+    mov ax, MEM_MCB
+    mov es, ax
+    mov byte ptr es:[0], 'M'
+    mov word ptr es:[1], APP_SEG
+    mov word ptr es:[3], CHILD_SEG - APP_SEG - 1
+    mov ax, CHILD_MCB
+    mov es, ax
+    mov byte ptr es:[0], 'Z'
+    mov word ptr es:[1], CHILD_SEG
+    mov word ptr es:[3], MEM_LIMIT - CHILD_SEG
+    mov ax, APP_SEG
+    mov es, ax
+    mov word ptr es:[2], CHILD_SEG
+    mov word ptr [current_psp], CHILD_SEG
+    mov word ptr [psp_parent], APP_SEG
+    mov byte ptr [exec_active], 1
+    call make_psp
+    cli
+    mov ax, CHILD_SEG
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0xfffe
+    mov word ptr ss:[0xfffe], 0
+    sti
+    push ax
+    mov ax, 0x0100
+    push ax
+    xor ax, ax
+    retf
+.L_exec_load_failed:
+    mov word ptr [exec_load_segment], APP_SEG
+    mov ax, 11 /* invalid EXE format / incomplete load */
+    jmp .L_set_error
+.L_exec_not_found:
+    mov ax, 2
+    jmp .L_set_error
+.L_exec_bad_function:
+    mov ax, 1
+    jmp .L_set_error
+.L_exec_bad_format:
+    mov ax, 11
+    jmp .L_set_error
+.L_exec_no_memory:
+    mov ax, 8
+    jmp .L_set_error
+
 /* Conventional memory MCB API. This prototype owns one MCB chain
  * in low memory and resets it between shell applications. No TSRs yet.
  * AH=48h: allocate BX paragraphs, AX=segment, failure BX=largest block.
@@ -2243,7 +2422,8 @@ int21_handler:
     mov ax, word ptr [mcb_req]
     mov word ptr es:[3], ax
 .L_mem_alloc_whole:
-    mov word ptr es:[1], APP_SEG
+    mov ax, word ptr [current_psp]
+    mov word ptr es:[1], ax
     mov ax, dx
     inc ax
     jmp .L_int21_handler_return
@@ -2254,11 +2434,12 @@ int21_handler:
     jmp .L_set_error
 .L_dos_free:
     mov bx, word ptr ss:[bp + 12] /* caller ES */
-    cmp bx, APP_SEG
+    cmp bx, word ptr [current_psp]
     je .L_mem_invalid
     call locate_mcb
     jc .L_mem_invalid
-    cmp word ptr es:[1], APP_SEG
+    mov ax, word ptr [current_psp]
+    cmp word ptr es:[1], ax
     jne .L_mem_invalid
     mov word ptr es:[1], 0
     call merge_free_mcbs
@@ -2268,7 +2449,8 @@ int21_handler:
     mov bx, word ptr ss:[bp + 12] /* caller ES */
     call locate_mcb
     jc .L_mem_invalid
-    cmp word ptr es:[1], APP_SEG
+    mov ax, word ptr [current_psp]
+    cmp word ptr es:[1], ax
     jne .L_mem_invalid
     mov ax, word ptr ss:[bp + 10]
     mov word ptr [mcb_req], ax
@@ -2368,7 +2550,8 @@ int21_handler:
     mov byte ptr [last_exit_code], 0  /* consumed as in DOS parent process */
     jmp .L_int21_handler_return
 .L_dos_get_psp:
-    mov word ptr ss:[bp + 10], APP_SEG  /* return PSP segment in BX */
+    mov ax, word ptr [current_psp]
+    mov word ptr ss:[bp + 10], ax  /* return PSP segment in BX */
     xor ax, ax
     jmp .L_int21_handler_return
 .L_int21_handler_write_handle:
@@ -3565,6 +3748,19 @@ cwd_text:           .space 128
 new_dir_cluster:    .word 0
 saved_parent_cluster:.word 0
 
+/* A minimal non-reentrant EXEC context; kernel shell is a recovery fallback. */
+current_psp:        .word APP_SEG
+psp_parent:         .word 0
+exec_load_segment:  .word APP_SEG
+exec_active:        .byte 0
+.align 2
+exec_parent_ss:     .word 0
+exec_parent_sp:     .word 0
+exec_parent_dta_seg:.word 0
+exec_parent_dta_off:.word 0
+command_filename:   .ascii "COMMAND COM"
+shell_failed_message:.asciz "Standalone COMMAND.COM unavailable; recovery shell active.\r\n"
+
 cmdline:            .space 128
 cmdtail:            .space 128
 cmdtail_len:        .byte 0
@@ -3578,7 +3774,7 @@ environment_template:
     .word 1
     .asciz "A:\\VELVETDOS"
 environment_end:
-banner:             .asciz "\r\nVelvetDOS 0.7.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.8.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"

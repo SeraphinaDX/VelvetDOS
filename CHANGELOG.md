@@ -1,22 +1,32 @@
 # VelvetDOS changelog
 
-## 0.7.0 — Program compatibility preview (2026-10-14)
+## 0.8.0 — Standalone shell and first DOS EXEC (2026-10-14)
 
-- Accept command-line arguments for built-in shell execution of DOS `.COM`
-  and restricted `.EXE` programs; uppercase only the executable token.
-- Fill the 128-byte PSP command-tail area with length, verbatim arguments and
-  DOS carriage-return terminator.
-- Populate PSP environment segment pointer, standard handle placeholders,
-  blank FCB name slots, and copied INT 22h/23h/24h vectors.
-- Provide a fixed read-only DOS environment at segment 2A00h, outside the
-  application memory allocation range.
-- Add `INT 21h AH=51h/62h` current-PSP queries and preliminary return code
-  tracking via AH=4Ch/4Dh; add `STATUS` shell debug command.
-- Add `PSPTEST.COM` and `EXITTEST.COM` regression fixtures. Preserve earlier
-  boot, FAT12, executable, directory and find-first test programs.
-- Expand offline tests to 23. Tests are **not** proof of 86Box runtime
-  behavior; complete the documented acceptance test before tagging.
+- Boot a genuine separately built `COMMAND.COM` as the resident shell, with
+  the existing kernel command prompt retained as a recovery environment.
+- Implement a limited `INT 21h AH=4B00` that loads and executes one child
+  `.COM` process while keeping the shell intact; restore the parent interrupt
+  frame, DTA, and PSP/memory allocation after child termination.
+- Populate the child's PSP parent field, expose a per-process PSP through
+  `AH=51h/62h`, and retain process return codes through `AH=4Dh`.
+- Add common DOS shell commands through public `INT 21h` interfaces, rather
+  than directly using private filesystem routines.
+- Add `EXECCHK.COM` to check that nested EXEC fails safely. Adapt `PSPTEST`
+  to validate its parent PSP in the new process structure.
+- Expand offline regression coverage from 23 to 25 tests, retaining all
+  previous boot image, FAT12, directory, file and command-tail fixtures.
+- Remain completely 8086/real-mode; MZ child EXEC, resident TSR semantics,
+  batch processing and arbitrary executable memory allocation remain future
+  work. No Pascal code has been added.
+
+**Validation:** host assembly/image build and 25 structural tests pass;
+**86Box execution of this release is still unverified**.
+
+## 0.7.0 — Program compatibility (2026-10-14)
+
+- 0.7.0 adds PSP command tails, environment and initial exit codes.
+- User reported the 0.7.0 86Box tests passing and merged/tagged the release.
 
 ## Earlier releases
 
-See the repository's tagged changelogs for 0.1.0–0.6.0 history.
+See repository version tags for the 0.1.0–0.6.0 changelogs.
