@@ -1,132 +1,114 @@
-# VelvetDOS 0.8.0 — Standalone COMMAND.COM preview
+# VelvetDOS 0.9.0 — MZ EXEC compatibility preview
 
-VelvetDOS is an experimental **GNU GPLv3-only, 8086 real-mode DOS-compatible
-operating system**, currently using GNU `as` and `ld` for assembly. Version
-0.8.0 introduces a genuine, separately assembled **`COMMAND.COM`** and an
-initial synchronous DOS `EXEC` service (`INT 21h AH=4B00`). This is still
-**pre-alpha**, not a general replacement for MS-DOS or FreeDOS.
+VelvetDOS is an experimental **GNU GPLv3-only**, **8086-compatible**,
+real-mode DOS-like operating system. This version extends the separate
+`COMMAND.COM` introduced in 0.8.0 so it can launch **bounded DOS MZ `.EXE`**
+children as well as `.COM` files. It is **pre-alpha**, not a drop-in replacement
+for MS-DOS or FreeDOS. Run it on a disposable floppy image in an emulator.
 
-The project has no Pascal or 386 protected-mode dependencies. The core is
-still 8086-compatible; 386/DPMI and 32-bit Free Pascal are later milestones.
+## What's new
 
-## What's new in 0.8.0
+- `INT 21h AH=4B00` now recognizes explicit `.COM` and `.EXE` names.
+- Validates the MZ header, declared file length, relocation table, entry
+  point, minimum memory, and initial stack against the current fixed child
+  allocation. Invalid MZ images return **DOS error 11** without starting a
+  child process.
+- Relocates MZ fixup words by the child load segment, moves initialized
+  EXE code/data past the PSP, initializes `CS:IP`, `SS:SP`, and `DS=ES=PSP`,
+  and returns to the resident parent shell when the child exits.
+- In `COMMAND.COM`, an unqualified executable name tries `.COM` and then
+  `.EXE` **only when the first lookup returns file-not-found**. Explicit
+  extensions are respected; there is no `PATH` searching yet.
+- `EXECHK.EXE`: new MZ fixture checking relocation, PSP parent, command
+  tail, and propagation of exit code `37h`. The existing `EXEDEMO.EXE`
+  can now launch directly from `COMMAND.COM`.
+- `BADMZ.EXE`: deliberately invalid relocation count to test clean error
+  recovery, preserving the shell for further commands.
+- Regression suite includes 28 host-side structural checks.
 
-- `COMMAND.COM` is a separately linked real-mode `.COM` program on the FAT12
-  floppy. The kernel finds and launches it during boot instead of displaying
-  the old built-in shell by default.
-- The built-in kernel shell remains an emergency fallback if `COMMAND.COM`
-  cannot be loaded or if it exits with `EXIT`.
-- The command interpreter uses DOS interrupts to handle `HELP`, `VER`, `CLS`,
-  `DIR`, `CD`, `MD`, `RD`, `STATUS`, `REBOOT`, and `EXIT`.
-- `INT 21h AH=4B00` loads **one** external `.COM` child synchronously in a
-  separate segment. The parent `COMMAND.COM` remains resident and resumes
-  when the child calls `INT 20h` or `INT 21h AH=4Ch`.
-- Child PSP has a conventional parent pointer, PSP, environment pointer,
-  command-line arguments, and its own default DTA. The parent's DTA,
-  interrupt frame, and conventional-memory allocation boundary are restored
-  when the child exits. `AH=4Dh` returns the child exit code.
-- `EXECCHK.COM` tests rejection of nested `EXEC` and child PSP reporting.
-  Earlier regression binaries are retained.
+## Build on Linux
 
-**Current supported EXEC subset:** `AH=4B, AL=00`, `.COM` file with an explicit
-8.3 extension, caller's environment selected using parameter block word zero,
-command-tail pointer at `ES:BX+2/+4`. This is not yet general DOS process
-management; it supports a single resident `COMMAND.COM` and a single child.
-
-## Build
-
-Requires `make`, GNU `as`/`ld` from binutils, and Python 3. QEMU is optional.
-86Box can boot the `.img` directly.
+Requires GNU Make, binutils (`as`, `ld`) and Python 3. Optional: QEMU.
 
 ```sh
 make clean test
-make run         # requires qemu-system-i386
+make run   # if qemu-system-i386 is installed
 ```
 
-The image is `build/velvetdos-0.8.0.img` (1.44 MB, FAT12). It contains both
-`KERNEL` in reserved sectors and normal filesystem files including
-`COMMAND.COM`, `HELLO.COM`, and all the regression binaries.
+The result is `build/velvetdos-0.9.0.img`, a FAT12 1.44 MB floppy image.
+Boot a fresh copy with **86Box** or QEMU. Build scripts do not need Pascal,
+a DOS cross-compiler, or an i386-only host.
 
-## Test in 86Box
+## 86Box manual regression
 
-Boot a **fresh, writable copy** of the image and confirm the interpreter
-prints `VelvetDOS COMMAND.COM 0.8.0` before the `A:\>` prompt.
+At the standalone `VelvetDOS COMMAND.COM 0.9.0` prompt:
 
 ```text
-VER
-DIR
-HELLO
-HELLO.COM
-PSPTEST hello MiXeD 123
-STATUS
-EXITTEST
-STATUS
-EXECCHK
-STATUS
-FINDTEST
-VLIST
-MEMORY
+A:\>VER
+A:\>HELLO
+A:\>EXECHK hello MiXeD
+A:\>STATUS
+A:\>EXEDEMO
+A:\>STATUS
+A:\>EXEDEMO.EXE
+A:\>BADMZ
+A:\>HELLO
+A:\>EXECCHK
+A:\>PSPTEST hello MiXeD 123
+A:\>FINDTEST
+A:\>VLIST
 ```
 
-Expected highlights:
+Expected:
 
-- `HELLO` and `HELLO.COM` each print the existing 16-bit message and **return
-  to the `COMMAND.COM` prompt**; multiple launches should work consecutively.
-- `PSPTEST hello MiXeD 123` reports PASS, including verifying that its PSP
-  parent points to resident COMMAND.COM at segment `3000h`.
-- `EXITTEST` reports a return value of `2A` hex; subsequent `STATUS` prints
-  `2A` (the value is consumed when queried).
-- `EXECCHK` prints `nested EXEC rejected, child PSP PASS!`. A following
-  `STATUS` prints `00`.
-- `FINDTEST`, `VLIST`, and `MEMORY` should continue working through DOS EXEC.
+- `EXECHK` prints `EXECHK.EXE: MZ, relocation, PSP, tail PASS!`
+- The first `STATUS` prints `37` hex (the EXE's success code).
+- `EXEDEMO` works from **COMMAND.COM** without entering recovery mode.
+- After `EXEDEMO`, `STATUS` prints `00` hex.
+- `BADMZ` returns to the prompt with `EXEC failed, DOS error AX=0B`.
+- Subsequent `HELLO`, `EXECCHK`, `PSPTEST` and `FINDTEST` still pass.
+- For the prior directory/file-writing tests (`PATHS`, `DIRGROW`, `WRITE`,
+  `APPEND`, `RECHECK`, `DELETE`), use a separate **writable disposable image**.
 
-For destructive directory/file regressions use another fresh writable floppy:
+This release has been assembled and verified with host-side tests, **not**
+run in 86Box in the build environment. The 86Box tests above still need
+confirmation before considering 0.9.0 validated.
 
-```text
-PATHS
-DIRGROW
-WRITE
-APPEND
-RECHECK
-```
+## Current EXEC subset and restrictions
 
-For the previously supported restricted **MZ `.EXE` test**, type `EXIT` to
-leave the standalone interpreter for the recovery kernel shell, then run
-`EXEDEMO` there. Running MZ children from `COMMAND.COM` is **not** supported
-by the first `EXEC` implementation.
+- `AH=4B00` only: one child at a time, launched from the resident
+  `COMMAND.COM`. Nested `EXEC` is intentionally rejected with AX=0008.
+- Small real-mode MZ files whose **complete disk file is at most 65,024
+  bytes**, with an initialized image that fits within 64 KiB. This does **not**
+  yet support large multi-segment images, overlays requiring special loaders,
+  DOS extenders, DPMI, or protected mode.
+- Execution uses fixed resident shell segment `3000h` and child PSP `5000h`;
+  entry relocation base is `5010h`. Full DOS allocator ownership, process
+  environment inheritance, file handle inheritance, file sharing, interrupt
+  restoration, and true TSR semantics are not implemented.
+- Only the bootstrap environment and simple command tails are supported.
+  The interpreter has no batch processing, redirection, pipes, `PATH`
+  searching, or memory-resident commands beyond its current small built-ins.
+- FAT12 metadata updates are not transactional; an interrupted write can
+  corrupt the floppy. **Do not use on valuable images or physical disks.**
+- The kernel retains its older restricted MZ path in the emergency recovery
+  shell. The new child MZ loader is a separate path and has tighter header
+  validation, pending 86Box tests.
+- Core stays 8086 assembly; **Pascal remains deferred** until later 386
+  DOS-extended support.
 
-## Known limits and cautions
+## Source layout
 
-- **Do not use on valuable disks or real hardware.** FAT metadata writes are
-  not transactional and can corrupt an interrupted disk image.
-- Only **one** child `.COM` process at once. Nested `EXEC` fails with DOS error
-  8. MZ `.EXE` child EXEC, shell PATH searching, batch files, pipes,
-  redirection, shell environment editing, TSRs, file handle inheritance,
-  and full DOS executable memory/ownership semantics are not implemented.
-- Parent segment is fixed at `3000h`, child at `5000h`. This is a staging
-  solution, not a production DOS memory allocator. Some programs that expect
-  a full conventional-memory allocation or inherited open files can fail.
-- The new COMMAND.COM handles only one argument string for `CD`/`MD`/`RD`,
-  and only single-part 8.3 program names (no wildcard executable lookup).
-- The old emergency shell remains part of the kernel in this version and
-  still supports the restricted MZ loader. It has not been removed yet.
-- Structural tests check boot image layout, generated binaries and source
-  contracts. They **do not substitute for 86Box runtime tests**. Runtime
-  execution of 0.8.0 has not been verified here.
+- `boot/` — FAT12 boot sector
+- `kernel/kernel.s` — interrupts, FAT12, loader, PSP and bounded EXEC
+- `programs/command.s` — standalone command interpreter
+- `programs/exechk.s` — DOS MZ child-execution test
+- `tools/mkmz.py`, `tools/mkbadmz.py` — MZ test image generation
+- `tests/` — offline regression suite
+- `docs/ROADMAP.md` — milestones
 
-## Directory structure
+## License
 
-- `boot/` — real-mode FAT12 floppy boot sector
-- `kernel/kernel.s` — DOS interrupts, filesystem, PSP, and first EXEC path
-- `programs/command.s` — standalone `COMMAND.COM` shell
-- `programs/execchk.s` — nested EXEC regression
-- `programs/*.s` — other DOS regression programs
-- `tools/` — floppy image and minimal MZ format build tools
-- `tests/` — host-side image integrity tests
-- `docs/ROADMAP.md` — roadmap
-
-## Licensing
-
-All original VelvetDOS source files are licensed under **GNU GPL version 3
-only**, identified by `SPDX-License-Identifier: GPL-3.0-only` in their headers.
-See `COPYING`. No Microsoft/FreeDOS source code is included.
+Original VelvetDOS source is **GNU GPL version 3 only** (`COPYING`,
+`SPDX-License-Identifier: GPL-3.0-only`). No Microsoft or FreeDOS kernel source
+is incorporated.

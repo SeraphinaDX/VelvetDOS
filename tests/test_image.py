@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.8.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.9.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,14 +37,14 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.8.0", kernel)
+        self.assertIn(b"VelvetDOS 0.9.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
         self.assertEqual(self.fat, self.img[74*512:83*512])
 
     def test_program_contents_match_cluster_chains(self):
-        names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
+        names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE", "EXECHK.EXE", "BADMZ.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
                  "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM")
         for i, name in enumerate(names):
@@ -84,6 +84,40 @@ class FloppyTest(unittest.TestCase):
         self.assertEqual(mz[reloc_offset:reloc_offset+4], b"\x00\x00\x00\x00")
         self.assertEqual(mz[32:34], b"\x00\x00")
         self.assertIn(b"MZ EXE relocation", mz)
+
+    def test_exechk_relocation_and_psp_fixture(self):
+        mz = (BIN / "EXECHK.EXE").read_bytes()
+        self.assertEqual(mz[:2], b"MZ")
+        self.assertEqual(struct.unpack_from("<H", mz, 6)[0], 1)
+        self.assertEqual(struct.unpack_from("<H", mz, 0x18)[0], 0x1c)
+        self.assertIn(b"EXECHK.EXE: MZ, relocation, PSP, tail PASS!", mz)
+        self.assertIn(bytes((0xb8, 0x37, 0x4c)), mz)
+
+    def test_invalid_mz_relocation_fixture_is_safe_to_reject(self):
+        bad = (BIN / "BADMZ.EXE").read_bytes()
+        good = (BIN / "EXECHK.EXE").read_bytes()
+        self.assertEqual(len(bad), len(good))
+        self.assertEqual(bad[:6], good[:6])
+        self.assertEqual(struct.unpack_from("<H", bad, 6)[0], 513)
+        self.assertEqual(struct.unpack_from("<H", good, 6)[0], 1)
+        self.assertEqual(bad[8:], good[8:])
+
+    def test_mz_child_exec_contract(self):
+        kernel = (ROOT / "kernel" / "kernel.s").read_text()
+        command = (ROOT / "programs" / "command.s").read_text()
+        for marker in ("prepare_child_exe:", ".L_exec_check_exe:",
+                       ".L_exec_run_exe:", "exe_image_total:",
+                       "exe_image_bytes:"):
+            self.assertIn(marker, kernel)
+        for marker in (".L_launch_failed:", "implicit_extension:",
+                       "extension_location:"):
+            self.assertIn(marker, command)
+        self.assertIn("jmp far ptr cs:[exe_ip]", kernel)
+        self.assertIn("call prepare_child_exe", kernel)
+        self.assertIn("cmp ax, 2", command)
+        implicit_block = command.split(".L_name_end:", 1)[1].split(".L_launch:", 1)[0]
+        self.assertIn("mov byte ptr [implicit_extension], 1", implicit_block)
+        self.assertIn("mov word ptr [extension_location], di", implicit_block)
 
     def test_dos_read_test_crosses_multiple_clusters(self):
         data = (BIN / "README.TXT").read_bytes()
@@ -215,7 +249,7 @@ class FloppyTest(unittest.TestCase):
             self.assertIn(bytes([0xb4, code]), blob)
         self.assertTrue(100 < len(blob) < 65024)
         self.assertNotEqual(blob[:2], b"MZ")
-        self.assertEqual(self.root[14*32:14*32+11], mkfloppy.dos_name("DIRGROW.COM"))
+        self.assertEqual(self.root[16*32:16*32+11], mkfloppy.dos_name("DIRGROW.COM"))
 
     def test_directory_buffer_cannot_overlap_application_memory(self):
         # The 8086 directory cache is at 2600:0000; 8*512 bytes fit
@@ -269,7 +303,7 @@ class FloppyTest(unittest.TestCase):
         self.assertIn("mov ax, 0x4b00", command)
         self.assertIn("mov ax, 0x4c00", command)
         self.assertIn("0x4e", command)  # DOS FindFirst
-        self.assertIn(b"COMMAND.COM 0.8.0", (BIN / "COMMAND.COM").read_bytes())
+        self.assertIn(b"COMMAND.COM 0.9.0", (BIN / "COMMAND.COM").read_bytes())
         self.assertIn(b"nested EXEC rejected", (BIN / "EXECCHK.COM").read_bytes())
 
     def test_process_memory_regions_do_not_overlap_kernel_or_data(self):

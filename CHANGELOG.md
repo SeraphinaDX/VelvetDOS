@@ -1,5 +1,20 @@
 # VelvetDOS changelog
 
+## 0.9.0 — Bounded MZ child EXEC (2026-10-14)
+
+- Extend resident COMMAND.COM EXEC beyond `.COM` to limited relocatable DOS
+  `.EXE` programs, with MZ header/relocation/stack validation and DOS error 11
+  on malformed executables. Keep one child at a time and 8086 compatibility.
+- Add default `.COM` then `.EXE` fallback for extensionless program commands.
+- Add `EXECHK.EXE` checking MZ relocation, PSP, argument tail and returned exit
+  code, plus intentionally malformed `BADMZ.EXE` to test clean rejection.
+- Include 28 host-side tests and retain old regression programs.
+- Continue deferring Pascal and 386 protected-mode execution.
+
+**Validation:** GNU assembly, 1.44 MB floppy creation and host-side tests pass.
+**86Box execution of 0.9.0 has not yet been checked.**
+
+
 ## 0.8.0 — Standalone shell and first DOS EXEC (2026-10-14)
 
 - Boot a genuine separately built `COMMAND.COM` as the resident shell, with
@@ -20,7 +35,7 @@
   work. No Pascal code has been added.
 
 **Validation:** host assembly/image build and 25 structural tests pass;
-**86Box execution of this release is still unverified**.
+**86Box execution of 0.8.0 has passed (reported by the project owner)**.
 
 ## 0.7.0 — Program compatibility (2026-10-14)
 

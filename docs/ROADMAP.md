@@ -12,10 +12,12 @@ optional 32-bit Free Pascal programs are future work. All code: GPLv3-only.
 - [x] 0.6.0 — Bounded FAT12 directory growth (86Box verified)
 - [x] 0.7.0 — PSP argument tail, environment, current PSP query, exit code
       (86Box verified)
-- [ ] 0.8.0 — Standalone COMMAND.COM, single-child COM EXEC and PSP parent
-      (built + offline tests passed; awaiting 86Box verification)
-- [ ] 0.9.0+ — MZ child EXEC, generalized DOS memory ownership, command
-      environment management, batch files and third-party DOS programs
+- [x] 0.8.0 — Standalone COMMAND.COM, single-child COM EXEC and PSP parent
+      (86Box verified)
+- [ ] 0.9.0 — Bounded MZ child EXEC, .COM-to-.EXE shell fallback,
+      malformed MZ rejection (built + offline tests; awaiting 86Box)
+- [ ] 0.10.0+ — More complete executable memory ownership, environment,
+      handle inheritance, batch files, third-party DOS application trials
 - [ ] Later — FAT error recovery, traditional device drivers, FAT16, 386
       protected mode, DPMI/GO32v2, optional 32-bit Free Pascal and self-hosting
 

@@ -1,8 +1,8 @@
-/* VelvetDOS 0.8.0 resident DOS command interpreter.
+/* VelvetDOS 0.9.0 resident DOS command interpreter.
  * SPDX-License-Identifier: GPL-3.0-only
  * This is a real .COM process which uses the documented DOS INT 21h API;
  * the kernel has a recovery prompt if COMMAND.COM exits or is unavailable.
- * Restriction: EXEC currently supports one child .COM program only.
+ * Restriction: EXEC supports one bounded .COM or MZ .EXE child at a time.
  */
 .intel_syntax noprefix
 .code16
@@ -151,9 +151,9 @@ parse_line:
     ret
 
 run_external:
-    /* Allow explicit .COM or append it to a bare executable token.
-     * .EXE child support is intentionally deferred: never pretend to run
-     * an MZ program using the COM loader. */
+    /* Explicit .COM/.EXE is respected. Without an extension, try .COM
+     * first, then .EXE only if DOS reports file not found (AX=0002). */
+    mov byte ptr [implicit_extension], 0
     mov si, offset token
     mov di, offset exec_name
     mov cx, 60
@@ -180,6 +180,8 @@ run_external:
     loop .L_copy_rest
     jmp .L_bad_name
 .L_name_end:
+    mov byte ptr [implicit_extension], 1
+    mov word ptr [extension_location], di
     mov byte ptr [di], '.'
     mov byte ptr [di+1], 'C'
     mov byte ptr [di+2], 'O'
@@ -193,6 +195,22 @@ run_external:
     mov ax, 0x4b00
     int 0x21
     jnc command_loop
+    cmp ax, 2
+    jne .L_launch_failed
+    cmp byte ptr [implicit_extension], 1
+    jne .L_launch_failed
+    mov di, word ptr [extension_location]
+    mov byte ptr [di+1], 'E'
+    mov byte ptr [di+2], 'X'
+    mov byte ptr [di+3], 'E'
+    mov dx, offset exec_name
+    mov bx, offset exec_parameters
+    push ds
+    pop es
+    mov ax, 0x4b00
+    int 0x21
+    jnc command_loop
+.L_launch_failed:
     push ax
     mov dx, offset exec_failed
     call print_dollar
@@ -354,12 +372,12 @@ nibble:
     int 0x21
     ret
 
-banner:       .ascii "\r\nVelvetDOS COMMAND.COM 0.8.0 [experimental]\r\n$"
+banner:       .ascii "\r\nVelvetDOS COMMAND.COM 0.9.0 [experimental]\r\n$"
 prefix:       .ascii "\r\nA:\\$"
 prompt_end:   .ascii ">$"
 crlf:         .ascii "\r\n$"
 help_text:    .ascii "HELP VER CLS DIR CD MD RD STATUS REBOOT EXIT\r\n"
-              .ascii "Run a .COM program; nested EXEC and MZ child EXEC unavailable.\r\n$"
+              .ascii "Run .COM and small MZ .EXE programs. Nested EXEC unavailable.\r\n$"
 status_text:  .ascii "Last exit code (hex): $"
 dir_failed:   .ascii "Directory operation failed.\r\n$"
 exec_failed:  .ascii "EXEC failed, DOS error AX=$"
@@ -387,6 +405,9 @@ cwd:           .space 68
 args_pointer:  .word 0
 cmdtail:       .space 128
 exec_name:     .space 68
+implicit_extension: .byte 0
+.align 2
+extension_location: .word 0
 token:         .space 64
 input:         .byte 124,0
                .space 125

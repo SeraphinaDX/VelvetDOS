@@ -1,8 +1,8 @@
-/* VelvetDOS 0.8.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.9.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and bounded multi-cluster directories (8.3); one resident shell
- * with a single non-nesting COM child, no multi-tasking.
+ * with a single non-nesting COM or bounded MZ EXE child, no multi-tasking.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -577,9 +577,14 @@ load_com:
     jz .L_load_com_failed
     cmp ax, 65024
     ja .L_load_com_failed
-    add ax, 511
+    mov cx, ax
     mov cl, 9
     shr ax, cl
+    mov bx, word ptr [file_size]
+    and bx, 511
+    jz .L_load_com_sector_count
+    inc ax
+.L_load_com_sector_count:
     mov cx, ax
     mov dx, word ptr [file_cluster]
     mov ax, word ptr [exec_load_segment]
@@ -2236,12 +2241,180 @@ int21_handler:
     or word ptr ss:[bp + 20], 1
     jmp .L_int21_handler_return
 
-/* DOS EXEC (AH=4B00) — one suspended parent plus one 16-bit .COM child.
+/* Validate, relocate, and compact a bounded MZ child image.
+ * Input: loaded DOS file at CHILD_SEG:0100h, size in file_size.
+ * Output: code/data at CHILD_SEG+10h:0000, relocated EXE entry in
+ * exe_ip/exe_cs and stack in exe_sp/exe_ss. CF=1 on malformed input.
+ * Does NOT alter the resident parent's PSP, stack, MCB, or DTA.
+ * Restriction: entire file <=65024 bytes; one <=64K initialized image;
+ * stack and declared minimum memory fit the existing child allocation.
+ */
+prepare_child_exe:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+    mov ax, CHILD_SEG
+    mov es, ax
+    cmp word ptr es:[0x100], 0x5a4d
+    jne .L_child_mz_bad
+    cmp word ptr [file_size_high], 0
+    jne .L_child_mz_bad
+    mov ax, word ptr [file_size]
+    cmp ax, 34
+    jb .L_child_mz_bad
+    /* Check exact MZ page-byte count (overlays beyond MZ are allowed). */
+    mov ax, word ptr es:[0x104]
+    test ax, ax
+    jz .L_child_mz_bad
+    cmp ax, 127
+    ja .L_child_mz_bad
+    dec ax
+    mov cl, 9
+    shl ax, cl
+    mov bx, word ptr es:[0x102]
+    cmp bx, 512
+    ja .L_child_mz_bad
+    test bx, bx
+    jnz .L_child_mz_last
+    mov bx, 512
+.L_child_mz_last:
+    add ax, bx
+    jc .L_child_mz_bad
+    cmp ax, word ptr [file_size]
+    ja .L_child_mz_bad
+    mov word ptr [exe_image_total], ax
+    mov ax, word ptr es:[0x108]
+    cmp ax, 2
+    jb .L_child_mz_bad
+    cmp ax, 0x0ff0
+    ja .L_child_mz_bad
+    mov word ptr [exe_hdrparas], ax
+    mov cl, 4
+    shl ax, cl
+    cmp ax, word ptr [exe_image_total]
+    jae .L_child_mz_bad
+    mov word ptr [exe_hdrbytes], ax
+    mov dx, word ptr [exe_image_total]
+    sub dx, ax
+    mov word ptr [exe_image_bytes], dx
+    /* MZ image + minimum extra allocation must fit child MCB. */
+    mov ax, dx
+    add ax, 15
+    jc .L_child_mz_bad
+    mov cl, 4
+    shr ax, cl
+    add ax, word ptr es:[0x10a]
+    jc .L_child_mz_bad
+    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    ja .L_child_mz_bad
+    mov ax, word ptr es:[0x116] /* relative CS */
+    mov word ptr [exe_cs], ax
+    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    jae .L_child_mz_bad
+    mov dx, ax
+    mov cl, 4
+    shl ax, cl
+    jc .L_child_mz_bad
+    add ax, word ptr es:[0x114] /* IP */
+    jc .L_child_mz_bad
+    cmp ax, word ptr [exe_image_bytes]
+    jae .L_child_mz_bad
+    mov ax, word ptr es:[0x114]
+    mov word ptr [exe_ip], ax
+    mov ax, word ptr es:[0x10e] /* relative SS */
+    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    jae .L_child_mz_bad
+    mov word ptr [exe_ss], ax
+    mov bx, word ptr es:[0x110] /* SP */
+    mov word ptr [exe_sp], bx
+    mov cl, 4
+    shr bx, cl
+    add bx, ax
+    jc .L_child_mz_bad
+    cmp bx, MEM_LIMIT - CHILD_SEG - 0x10
+    jae .L_child_mz_bad
+    /* Relocation table must be entirely within MZ header. */
+    mov bx, word ptr es:[0x118] /* relocation offset */
+    cmp bx, 0x001c
+    jb .L_child_mz_bad
+    mov cx, word ptr es:[0x106] /* count */
+    cmp cx, 512
+    ja .L_child_mz_bad
+    mov ax, cx
+    shl ax, 1
+    shl ax, 1
+    add ax, bx
+    jc .L_child_mz_bad
+    cmp ax, word ptr [exe_hdrbytes]
+    ja .L_child_mz_bad
+    add bx, 0x100
+    jc .L_child_mz_bad
+    mov word ptr [exe_reloc_remaining], cx
+.L_child_mz_reloc:
+    cmp word ptr [exe_reloc_remaining], 0
+    je .L_child_mz_copy
+    /* Relocation entries are 16-bit offset, then relative segment. */
+    mov si, word ptr es:[bx]
+    mov dx, word ptr es:[bx+2]
+    mov ax, dx
+    mov cl, 4
+    shl ax, cl
+    jc .L_child_mz_bad
+    add ax, si
+    jc .L_child_mz_bad
+    inc ax
+    jc .L_child_mz_bad
+    cmp ax, word ptr [exe_image_bytes]
+    jae .L_child_mz_bad
+    mov ax, CHILD_SEG + 0x10
+    add ax, word ptr [exe_hdrparas]
+    add ax, dx
+    mov ds, ax
+    add word ptr [si], CHILD_SEG + 0x10
+    push cs
+    pop ds
+    add bx, 4
+    dec word ptr [exe_reloc_remaining]
+    jmp .L_child_mz_reloc
+.L_child_mz_copy:
+    /* Source lies above destination, so a forward copy is overlap-safe. */
+    mov ax, CHILD_SEG + 0x10
+    mov es, ax
+    add ax, word ptr [exe_hdrparas]
+    mov ds, ax
+    xor si, si
+    xor di, di
+    mov cx, word ptr cs:[exe_image_bytes]
+    rep movsb
+    mov ax, CHILD_SEG + 0x10
+    add word ptr cs:[exe_cs], ax
+    add word ptr cs:[exe_ss], ax
+    clc
+    jmp .L_child_mz_done
+.L_child_mz_bad:
+    stc
+.L_child_mz_done:
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* DOS EXEC (AH=4B00) — one suspended parent plus a .COM or small MZ .EXE child.
  * DS:DX is an 8.3 DOS path; ES:BX points to the DOS EXEC parameter block.
  * Only the command tail pointer at offsets +2/+4 is read, and a zero
  * environment segment inherits the fixed bootstrap environment. Errors
  * return through the parent INT 21h frame, success resumes after child exit.
- * No nested EXEC, .EXE child, handle inheritance, or arbitrary allocation yet.
+ * No nested EXEC, handle inheritance, or arbitrary allocation yet.
  */
 .L_dos_exec:
     cmp al, 0
@@ -2256,14 +2429,25 @@ int21_handler:
     jc .L_exec_not_found
     cmp byte ptr [path_directory_only], 0
     jne .L_exec_not_found
-    /* A loader for general MZ files and multiple resident children comes
-     * later. Explicit .COM filenames are required for this first step. */
+    /* Explicit .COM and .EXE supported. Keep the selected format until
+     * after the command tail is copied from the parent process. */
+    mov byte ptr [exec_exe_mode], 0
     cmp byte ptr [filename + 8], 'C'
-    jne .L_exec_bad_format
+    jne .L_exec_check_exe
     cmp byte ptr [filename + 9], 'O'
     jne .L_exec_bad_format
     cmp byte ptr [filename + 10], 'M'
     jne .L_exec_bad_format
+    jmp .L_exec_format_ok
+.L_exec_check_exe:
+    cmp byte ptr [filename + 8], 'E'
+    jne .L_exec_bad_format
+    cmp byte ptr [filename + 9], 'X'
+    jne .L_exec_bad_format
+    cmp byte ptr [filename + 10], 'E'
+    jne .L_exec_bad_format
+    mov byte ptr [exec_exe_mode], 1
+.L_exec_format_ok:
     call find_file
     jc .L_exec_not_found
     test byte ptr [file_attributes], 0x10
@@ -2303,6 +2487,14 @@ int21_handler:
     mov word ptr [exec_load_segment], CHILD_SEG
     call load_com
     jc .L_exec_load_failed
+    /* .EXE and .COM share the bounded floppy-file staging loader; for
+     * MZ, validate and apply relocation records before touching parent
+     * process state. A malformed EXE must leave COMMAND.COM running. */
+    cmp byte ptr [exec_exe_mode], 0
+    je .L_exec_image_ready
+    call prepare_child_exe
+    jc .L_exec_load_failed
+.L_exec_image_ready:
     mov ax, word ptr [dta_seg]
     mov word ptr [exec_parent_dta_seg], ax
     mov ax, word ptr [dta_off]
@@ -2332,6 +2524,8 @@ int21_handler:
     mov ax, CHILD_SEG
     mov ds, ax
     mov es, ax
+    cmp byte ptr cs:[exec_exe_mode], 0
+    jne .L_exec_run_exe
     mov ss, ax
     mov sp, 0xfffe
     mov word ptr ss:[0xfffe], 0
@@ -2341,6 +2535,18 @@ int21_handler:
     push ax
     xor ax, ax
     retf
+.L_exec_run_exe:
+    /* EXE entry CS:IP and SS:SP are relative to its load segment,
+     * CHILD_SEG+10h. DS and ES initially identify the child's PSP. */
+    mov ax, word ptr cs:[exe_ss]
+    mov ss, ax
+    mov sp, word ptr cs:[exe_sp]
+    mov ax, CHILD_SEG
+    mov ds, ax
+    mov es, ax
+    sti
+    xor ax, ax
+    jmp far ptr cs:[exe_ip]
 .L_exec_load_failed:
     mov word ptr [exec_load_segment], APP_SEG
     mov ax, 11 /* invalid EXE format / incomplete load */
@@ -3722,6 +3928,8 @@ sync_error_message: .asciz "WARNING: disk metadata sync failed.\r\n"
 .align 2
 exe_hdrparas:      .word 0
 exe_hdrbytes:       .word 0
+exe_image_total:    .word 0
+exe_image_bytes:    .word 0
 exe_reloc_remaining:.word 0
 exe_cs:            .word 0
 exe_ip:            .word 0
@@ -3753,6 +3961,7 @@ current_psp:        .word APP_SEG
 psp_parent:         .word 0
 exec_load_segment:  .word APP_SEG
 exec_active:        .byte 0
+exec_exe_mode:      .byte 0
 .align 2
 exec_parent_ss:     .word 0
 exec_parent_sp:     .word 0
@@ -3774,7 +3983,7 @@ environment_template:
     .word 1
     .asciz "A:\\VELVETDOS"
 environment_end:
-banner:             .asciz "\r\nVelvetDOS 0.8.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.9.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
