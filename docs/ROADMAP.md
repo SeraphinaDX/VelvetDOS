@@ -1,18 +1,21 @@
-# VelvetDOS compatibility roadmap
+# VelvetDOS roadmap
 
-VelvetDOS targets compatibility with genuine real-mode MS-DOS programs on
-8086-class IBM PC compatible machines. GNU GPLv3-only. Pascal, if introduced,
-will be reserved for future 386 protected-mode DOS-extended applications.
+The 8086 real-mode kernel is the priority; no 386 extender or Pascal build
+is required for early releases. All releases remain experimental until proven
+in actual PC emulation. GNU GPLv3-only.
 
-- **0.1.0** — boot, FAT12, basic `.COM` loading (86Box tested).
-- **0.2.0** — small MZ `.EXE`, basic DOS file APIs and memory (86Box tested).
-- **0.3.0** — writable FAT12 root directory (merged and tagged).
-- **0.4.0 preview** — FAT12 8.3 directories, paths, `CD`/`MD`/`RD`, directory
-  API regression program; **needs 86Box validation**.
-- **0.5.0 candidate** — directory chain growth, FAT timestamp support, DOS
-  find-first/find-next (`AH=4Eh/4Fh`), attributes and robust error reporting.
-- **Longer term** — environment/argument passing, batch files, shell, device
-  drivers, broader MZ loading, TSR support, EMS/XMS, then optional 386 DPMI.
+- [x] 0.1.0 — bootable FAT12 floppy and COM execution
+- [x] 0.2.0 — basic DOS file handles, small MZ binaries, memory allocation
+- [x] 0.3.0 — writable FAT12 root files
+- [x] 0.4.0 — single-cluster directories and DOS path navigation
+- [ ] 0.5.0 — DOS Find First/Next, attributes, timestamps, DTA and free space
+      (implemented, awaiting 86Box runtime acceptance)
+- [ ] 0.6.0 — multi-cluster directory growth, safer FAT chain and metadata
+      updates, root and subdirectory stress tests
+- [ ] 0.7.0 — PSP/environment/command arguments, DOS error and attribute
+      compatibility, executable command interpreter
+- [ ] Later — broader DOS games/app compatibility, proper 386 DPMI/GO32v2,
+      optional 32-bit Free Pascal user programs, self-hosting investigation
 
-The goal is compatibility, not merely a DOS-looking prompt. No release claims
-100% compatibility until real applications and hardware have been tested.
+Never test writable FAT changes on valuable media. Every filesystem bug
+requires a regression before merging.

@@ -1,4 +1,4 @@
-/* VelvetDOS 0.4.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.5.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and single-cluster subdirectories (8.3 only); one DOS application at a time.
@@ -39,11 +39,15 @@ _start:
     mov word ptr es:[0x20 * 4 + 2], ax
     mov word ptr es:[0x21 * 4], offset int21_handler
     mov word ptr es:[0x21 * 4 + 2], ax
+    mov word ptr [dta_seg], 0
+    mov word ptr [dta_off], offset kernel_dta
     call load_tables
     mov si, offset banner
     call print_z
 shell_loop:
     mov ax, cs
+    mov word ptr [dta_seg], ax
+    mov word ptr [dta_off], offset kernel_dta
     mov ds, ax
     mov es, ax
     mov ss, ax
@@ -664,6 +668,8 @@ make_psp:
     mov word ptr es:[2], MEM_LIMIT
     mov byte ptr es:[0x80], 0
     mov byte ptr es:[0x81], 13
+    mov word ptr [dta_seg], APP_SEG
+    mov word ptr [dta_off], 0x80
     pop es
     pop di
     pop cx
@@ -1204,6 +1210,20 @@ int21_handler:
     je .L_int21_handler_default_drive
     cmp ah, 0x30
     je .L_int21_handler_version
+    cmp ah, 0x1a
+    je .L_dos_set_dta
+    cmp ah, 0x2f
+    je .L_dos_get_dta
+    cmp ah, 0x36
+    je .L_dos_diskfree
+    cmp ah, 0x43
+    je .L_dos_attributes
+    cmp ah, 0x4e
+    je .L_dos_findfirst
+    cmp ah, 0x4f
+    je .L_dos_findnext
+    cmp ah, 0x57
+    je .L_dos_timestamp
     cmp ah, 0x39
     je .L_dos_mkdir
     cmp ah, 0x3a
@@ -1375,6 +1395,209 @@ int21_handler:
     jmp .L_int21_handler_return
 .L_getcwd_bad:
     mov ax, 15
+    jmp .L_set_error
+
+/* DOS disk transfer area and disk geometry. DTA belongs to the user process,
+ * defaults to PSP:0080 and is restored for each shell application. */
+.L_dos_set_dta:
+    mov ax, word ptr ss:[bp + 14]
+    mov word ptr [dta_seg], ax
+    mov ax, word ptr ss:[bp + 6]
+    mov word ptr [dta_off], ax
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_get_dta:
+    mov ax, word ptr [dta_seg]
+    mov word ptr ss:[bp + 12], ax      /* saved ES returned to caller */
+    mov ax, word ptr [dta_off]
+    mov word ptr ss:[bp + 10], ax      /* saved BX returned to caller */
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_diskfree:
+    mov al, byte ptr ss:[bp + 6]     /* DL: 0=default, 1=A: */
+    cmp al, 1
+    ja .L_dos_diskfree_bad
+    mov si, 2
+    xor di, di
+.L_dos_diskfree_loop:
+    mov ax, si
+    call fat_next
+    test ax, ax
+    jnz .L_dos_diskfree_used
+    inc di
+.L_dos_diskfree_used:
+    inc si
+    cmp si, 2784
+    jbe .L_dos_diskfree_loop
+    mov word ptr ss:[bp + 10], di    /* BX free clusters */
+    mov word ptr ss:[bp + 8], 512   /* CX bytes per sector */
+    mov word ptr ss:[bp + 6], 2783  /* DX total clusters */
+    mov ax, 1                       /* sectors per cluster */
+    jmp .L_int21_handler_return
+.L_dos_diskfree_bad:
+    mov ax, 0xffff                  /* invalid drive */
+    jmp .L_int21_handler_return
+
+/* DOS file attributes, AH=43h AL=00 get (CX), AL=01 set (CX).
+ * Only ordinary file attributes may be changed; directories are read-only
+ * to this API. The raw FAT entry is the authoritative source. */
+.L_dos_attributes:
+    mov byte ptr [attr_mode], al
+    cmp al, 1
+    ja .L_find_bad_function
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call filename_from_es_si
+    jc .L_open_not_found
+    cmp byte ptr [path_directory_only], 0
+    jne .L_open_not_found
+    call find_file
+    jc .L_open_not_found
+    cmp byte ptr [attr_mode], 0
+    jne .L_dos_attr_set
+    xor cx, cx
+    mov cl, byte ptr [file_attributes]
+    mov word ptr ss:[bp + 8], cx
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_attr_set:
+    test byte ptr [file_attributes], 0x10
+    jnz .L_open_denied
+    mov ax, word ptr ss:[bp + 8]
+    test ax, 0xffd8                /* only R/H/S/A flags */
+    jnz .L_open_denied
+    call root_is_open
+    jc .L_open_denied
+    call select_directory
+    jc .L_write_failure
+    mov di, word ptr [file_dir_offset]
+    mov ax, word ptr ss:[bp + 8]
+    mov byte ptr es:[di + 11], al
+    call flush_directory
+    jc .L_write_failure
+    call flush_metadata
+    jc .L_write_failure
+    xor ax, ax
+    jmp .L_int21_handler_return
+
+/* DOS timestamp, AH=57h AL=0 get CX(time)/DX(date), AL=1 set.
+ * Reads/writes FAT directory fields, independent of the file's data. */
+.L_dos_timestamp:
+    mov byte ptr [attr_mode], al
+    cmp al, 1
+    ja .L_find_bad_function
+    mov bx, word ptr ss:[bp + 10]
+    call locate_handle
+    jc .L_invalid_handle
+    cmp byte ptr [attr_mode], 1
+    jne .L_dos_timestamp_fetch
+    cmp byte ptr [bx + 1], 0
+    je .L_open_denied
+.L_dos_timestamp_fetch:
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr [saved_parent_cluster], ax
+    mov ax, word ptr [bx + 14]
+    mov word ptr [dir_parent_cluster], ax
+    mov di, word ptr [bx + 12]
+    call select_directory
+    jc .L_dos_timestamp_ioerr
+    cmp byte ptr [attr_mode], 1
+    je .L_dos_timestamp_put
+    mov ax, word ptr es:[di + 22]
+    mov word ptr ss:[bp + 8], ax
+    mov ax, word ptr es:[di + 24]
+    mov word ptr ss:[bp + 6], ax
+    jmp .L_dos_timestamp_done
+.L_dos_timestamp_put:
+    mov ax, word ptr ss:[bp + 8]
+    mov word ptr es:[di + 22], ax
+    mov ax, word ptr ss:[bp + 6]
+    mov word ptr es:[di + 24], ax
+    call flush_directory
+    jc .L_dos_timestamp_ioerr
+    call flush_metadata
+    jc .L_dos_timestamp_ioerr
+.L_dos_timestamp_done:
+    mov ax, word ptr [saved_parent_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_timestamp_ioerr:
+    mov ax, word ptr [saved_parent_cluster]
+    mov word ptr [dir_parent_cluster], ax
+    jmp .L_write_failure
+
+/* Search state is stored inside the caller-selected DTA, so separate DTAs
+ * can maintain separate iterators. DTA bytes 0..17 are VelvetDOS private;
+ * bytes 21..42 match standard DOS FindFirst result layout. */
+.L_dos_findfirst:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call filename_from_es_si
+    jc .L_find_path_error
+    cmp byte ptr [path_directory_only], 0
+    jne .L_find_path_error
+    /* Expand a star into '?' wildcards within each 8.3 name field. */
+    xor bx, bx
+.L_find_expand_loop:
+    cmp byte ptr [filename + bx], '*'
+    jne .L_find_expand_next
+    mov di, bx
+    mov dx, 8
+    cmp bx, 8
+    jae .L_find_expand_extension
+    /* DOS treats an unqualified NAME* as matching every extension. */
+    cmp word ptr [filename + 8], 0x2020
+    jne .L_find_expand_fill
+    cmp byte ptr [filename + 10], ' '
+    jne .L_find_expand_fill
+    mov byte ptr [filename + 8], '?'
+    mov byte ptr [filename + 9], '?'
+    mov byte ptr [filename + 10], '?'
+    jmp .L_find_expand_fill
+.L_find_expand_extension:
+    mov dx, 11
+.L_find_expand_fill:
+    mov byte ptr [filename + di], '?'
+    inc di
+    cmp di, dx
+    jb .L_find_expand_fill
+    mov bx, di
+    jmp .L_find_expand_test
+.L_find_expand_next:
+    inc bx
+.L_find_expand_test:
+    cmp bx, 11
+    jb .L_find_expand_loop
+    mov ax, word ptr [dta_seg]
+    mov es, ax
+    mov di, word ptr [dta_off]
+    mov si, offset filename
+    mov cx, 11
+    rep movsb
+    mov bx, word ptr [dta_off]
+    mov ax, word ptr ss:[bp + 8]
+    mov byte ptr es:[bx + 11], al
+    mov ax, word ptr [dir_parent_cluster]
+    mov word ptr es:[bx + 12], ax
+    mov word ptr es:[bx + 14], 0
+    mov word ptr es:[bx + 16], 0x4456 /* 'VD' */
+    call dta_findnext
+    jc .L_set_error
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_findnext:
+    call dta_findnext
+    jc .L_set_error
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_find_path_error:
+    mov ax, 3
+    jmp .L_set_error
+.L_find_bad_function:
+    mov ax, 1
     jmp .L_set_error
 
 /* FAT12 8.3 file APIs (four handles: 5..8).
@@ -1927,6 +2150,163 @@ int21_handler:
     pop es
     pop ds
     iret
+
+/* Read saved DTA search parameters, scan FAT directory, publish DOS result.
+ * Return CF=1, AX=18 when exhausted; AX=1 for an invalid DTA.
+ * Never relies on a kernel-global iterator: per-DTA next index is persisted. */
+dta_findnext:
+    mov ax, word ptr [dta_seg]
+    mov es, ax
+    mov bx, word ptr [dta_off]
+    cmp word ptr es:[bx + 16], 0x4456
+    jne .L_dn_bad
+    push si
+    push di
+    push cx
+    push dx
+    mov si, bx
+    mov di, offset search_pattern
+    mov cx, 11
+.L_dn_copy_pattern:
+    mov al, byte ptr es:[si]
+    mov byte ptr [di], al
+    inc si
+    inc di
+    loop .L_dn_copy_pattern
+    mov al, byte ptr es:[bx + 11]
+    mov byte ptr [search_attr], al
+    mov ax, word ptr es:[bx + 12]
+    mov word ptr [dir_parent_cluster], ax
+    mov ax, word ptr es:[bx + 14]
+    mov word ptr [search_index], ax
+    call select_directory
+    jc .L_dn_disk_error
+.L_dn_scan:
+    mov ax, word ptr [search_index]
+    cmp ax, cx
+    jae .L_dn_not_found
+    mov di, ax
+    shl di, 1
+    shl di, 1
+    shl di, 1
+    shl di, 1
+    shl di, 1                    /* directory index * 32 */
+    inc word ptr [search_index]
+    cmp byte ptr es:[di], 0
+    je .L_dn_not_found
+    cmp byte ptr es:[di], 0xe5
+    je .L_dn_scan
+    mov al, byte ptr es:[di + 11]
+    cmp al, 0x0f                 /* long filename record */
+    je .L_dn_scan
+    test al, 0x08                /* volume labels unsupported */
+    jnz .L_dn_scan
+    test al, 0x02
+    jz .L_dn_check_system
+    test byte ptr [search_attr], 0x02
+    jz .L_dn_scan
+.L_dn_check_system:
+    test al, 0x04
+    jz .L_dn_check_directory
+    test byte ptr [search_attr], 0x04
+    jz .L_dn_scan
+.L_dn_check_directory:
+    test al, 0x10
+    jz .L_dn_check_name
+    test byte ptr [search_attr], 0x10
+    jz .L_dn_scan
+.L_dn_check_name:
+    xor si, si
+.L_dn_match:
+    mov al, byte ptr [search_pattern + si]
+    cmp al, '?'
+    je .L_dn_match_next
+    mov bx, di
+    add bx, si
+    cmp al, byte ptr es:[bx]
+    jne .L_dn_scan
+.L_dn_match_next:
+    inc si
+    cmp si, 11
+    jb .L_dn_match
+    /* Found: copy 32-byte raw FAT entry before reusing ES for DTA. */
+    mov si, di
+    mov bx, offset search_entry
+    mov dx, 32
+.L_dn_copy_entry:
+    mov al, byte ptr es:[si]
+    mov byte ptr [bx], al
+    inc bx
+    inc si
+    dec dx
+    jnz .L_dn_copy_entry
+    mov ax, word ptr [dta_seg]
+    mov es, ax
+    mov bx, word ptr [dta_off]
+    mov ax, word ptr [search_index]
+    mov word ptr es:[bx + 14], ax
+    mov al, byte ptr [search_entry + 11]
+    mov byte ptr es:[bx + 21], al
+    mov ax, word ptr [search_entry + 22]
+    mov word ptr es:[bx + 22], ax
+    mov ax, word ptr [search_entry + 24]
+    mov word ptr es:[bx + 24], ax
+    mov ax, word ptr [search_entry + 28]
+    mov word ptr es:[bx + 26], ax
+    mov ax, word ptr [search_entry + 30]
+    mov word ptr es:[bx + 28], ax
+    /* Format NAME.EXT as a zero-terminated 13-byte DOS string. */
+    mov di, bx
+    add di, 30
+    xor si, si
+.L_dn_name:
+    cmp si, 8
+    jae .L_dn_ext
+    mov al, byte ptr [search_entry + si]
+    cmp al, ' '
+    je .L_dn_name_skip
+    mov byte ptr es:[di], al
+    inc di
+.L_dn_name_skip:
+    inc si
+    jmp .L_dn_name
+.L_dn_ext:
+    cmp byte ptr [search_entry + 8], ' '
+    je .L_dn_name_done
+    mov byte ptr es:[di], '.'
+    inc di
+.L_dn_ext_loop:
+    cmp si, 11
+    jae .L_dn_name_done
+    mov al, byte ptr [search_entry + si]
+    cmp al, ' '
+    je .L_dn_ext_skip
+    mov byte ptr es:[di], al
+    inc di
+.L_dn_ext_skip:
+    inc si
+    jmp .L_dn_ext_loop
+.L_dn_name_done:
+    mov byte ptr es:[di], 0
+    clc
+    jmp .L_dn_exit
+.L_dn_disk_error:
+    mov ax, 30
+    stc
+    jmp .L_dn_exit
+.L_dn_not_found:
+    mov ax, 18                    /* DOS: no more files */
+    stc
+.L_dn_exit:
+    pop dx
+    pop cx
+    pop di
+    pop si
+    ret
+.L_dn_bad:
+    mov ax, 1
+    stc
+    ret
 
 /* Directory operations share the path resolver and 8.3 FAT12 entries.
  * A directory owns exactly one cluster (16 entries including . and ..).
@@ -2812,6 +3192,18 @@ read_sector:
     pop ax
     ret
 
+/* DOS DTA search buffer and per-process pointer. */
+.align 2
+dta_seg:          .word 0
+dta_off:          .word 0
+kernel_dta:       .space 43
+search_pattern:   .space 11
+search_attr:      .byte 0
+.align 2
+search_index:     .word 0
+search_entry:     .space 32
+attr_mode:        .byte 0
+
 /* Runtime state and messages. */
 mcb_req:           .word 0
 mcb_largest:       .word 0
@@ -2873,7 +3265,7 @@ new_dir_cluster:    .word 0
 saved_parent_cluster:.word 0
 
 cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.4.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.5.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"

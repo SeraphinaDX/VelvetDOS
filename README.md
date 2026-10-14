@@ -1,166 +1,99 @@
-# VelvetDOS 0.4.0 (development preview)
+# VelvetDOS 0.5.0 — DOS filesystem API preview
 
-VelvetDOS is an experimental 8086-compatible, real-mode DOS operating system,
-licensed under **GNU GPL version 3 only**. It aims to execute unmodified DOS
-applications. It is **not yet a complete MS-DOS implementation**.
+VelvetDOS is an experimental **GPLv3-only**, **8086 real-mode** DOS-compatible
+operating system. It is **not a full replacement for MS-DOS**; use only on
+**disposable, writable** FAT12 floppy disk images. The kernel remains assembly
+only. There is no Free Pascal or 386 protected-mode code yet.
 
-Version 0.4.0 extends the FAT12 filesystem from root-only operation to **nested
-8.3 directories**, including DOS path parsing, directory navigation, and file
-operations within those directories. It builds on the 0.3.0 release that was
-merged and tagged by the project owner; 0.3.0 runtime test results were not
-separately reported here.
+## What's new in 0.5.0
 
-## Corrected 0.4.0 test build
+- `INT 21h AH=1Ah / 2Fh`: set/get Disk Transfer Area (DTA), defaulting to the
+  running program's PSP:0080. A program can maintain independent searches with
+  different DTA buffers.
+- `AH=4Eh / 4Fh`: DOS-style Find First / Find Next, 8.3 wildcards `*` and `?`,
+  directory-relative or absolute paths, per-DTA search state, DTA result layout
+  (attribute/time/date/size/name). Hidden, system, and directory entries are
+  excluded unless requested in `CX`. Volume labels/LFN are not supported.
+- `AH=43h AL=0/1`: get or set ordinary file attributes. Set supports read-only,
+  hidden, system, and archive bits; directories are not mutable by this call.
+- `AH=57h AL=0/1`: get/set FAT modification date/time for an open file handle;
+  setting requires a write-capable handle.
+- `AH=36h`: free-space report for `A:`/default drive (1 sector/cluster,
+  512 bytes/sector, 2783 FAT12 clusters); invalid drive returns `AX=FFFFh`.
+- `VLIST.COM`: native DOS directory listing using only `AH=4Eh/4Fh`, not
+  VelvetDOS shell internals.
+- `FINDTEST.COM`: separately assembled native DOS API regression for DTA,
+  Find First/Next, wildcards, hidden file filtering, attributes, timestamps,
+  disk free space and a cleanup sequence.
 
-- Fix GNU assembler backslash parsing: four path comparisons must use `0x5C`,
-  not `'\'`, which was assembled as `0x27` (apostrophe). Previously
-  `LAB\ONE` could become a *single invalid FAT directory entry*.
-- Keep the stage-by-stage `PATHS.COM` diagnostic: a failure now reports the
-  exact operation and AX return code.
-- Add a compiled-opcode regression check for all four separators.
-- Use a fresh writable floppy image. Discard older test images with malformed
-  directory names rather than attempting to repair them using VelvetDOS.
+## Build
 
-## New in 0.4.0
-
-- `INT 21h AH=39h`: create a subdirectory.
-- `INT 21h AH=3Ah`: remove an **empty** subdirectory.
-- `INT 21h AH=3Bh`: set the current directory.
-- `INT 21h AH=47h`: return the current directory (DOS path without drive/initial slash).
-- DOS 8.3 paths in file create, open, and delete APIs. Relative paths,
-  `A:`, `A:\`, `.`, `..`, backslashes, and forward slashes are supported.
-- Directory-aware handles: file metadata is synchronized to the correct
-  directory entry, not always the root.
-- Built-in shell adds `CD`, `MD`, `RD`, and a directory-aware `DIR`, with
-  current-directory display in the `A:\` prompt.
-- New `PATHS.COM` executable tests directory syscalls, nested paths,
-  CWD reporting, 600-byte file write/read, nonempty-directory rejection,
-  cleanup, and failure to enter a removed directory.
-
-**Compatibility scope:** Each non-root directory occupies exactly **one FAT12
-cluster (512 bytes)**. Its two dot entries leave **14 usable entries**.
-Directories may be nested up to **8 levels**; AH=47h rejects directory strings
-that do not fit in its traditional 64-byte buffer. Existing externally-created
-multi-cluster directories can be browsed only within their first cluster;
-their removal is refused if the FAT chain extends further.
-
-**Verification:** The source assembles using the GNU assembler's 8086 mode,
-the 1.44 MB FAT12 image builds, and 16 offline integrity/structural tests pass.
-The new directory code has **not yet been executed in 86Box**. Mark the release
-as a preview until the runtime tests below pass.
-
-## Build on Linux
-
-Requires GNU Make, GNU binutils (`as`, `ld`), and Python 3. QEMU is optional,
-or use 86Box with an IBM PC-compatible floppy controller.
+Requires GNU Make, GNU binutils (`as`, `ld`) and Python 3. QEMU or 86Box is
+required for **runtime** verification.
 
 ```sh
 make clean test
-make run  # requires qemu-system-i386
+make run                     # optional QEMU
 ```
 
-Image: `build/velvetdos-0.4.0.img` (1.44 MB). **Boot a disposable, writable
-copy**. Do not test experimental FAT writes on a valuable image or physical
-storage.
+Boot `build/velvetdos-0.5.0.img` in 86Box as a **writable floppy**. Prefer a
+fresh copy when running a test that modifies the disk.
 
-## Test in 86Box
+## 86Box acceptance checks
 
-### New automatic test
+Start with a **fresh image**, then run:
 
-At the `A:\>` prompt on a **fresh writable image**, run:
-
-```text
-PATHS
+```dos
+A:\>VLIST
+A:\>FINDTEST
+A:\>HELLO
+A:\>EXEDEMO
+A:\>READ
+A:\>MEMORY
 ```
 
-Expected result:
+- `VLIST` should list `HELLO.COM`, `EXEDEMO.EXE`, `VLIST.COM`, and other
+  boot-disk entries. Its listing is obtained through DOS APIs.
+- `FINDTEST` should print `FINDTEST.COM: all DOS API checks PASS!`.
+  If it fails, it prints the API step and AX result; report that output.
+- After `FINDTEST`, `ATTR05.TST` should **not** remain on the disk.
 
-```text
-PATHS.COM: directories, paths, file I/O PASS!
-```
+For writable FAT12 regression, run `WRITE`, `APPEND`, `RECHECK`, then on
+**the same writable image after restarting 86Box** run `RECHECK` again. Use
+`DELETE` to clean up. Run `PATHS` separately on a **fresh image**: it creates
+and removes `LAB\ONE` and reports pass/fail by stage.
 
-`PATHS` creates `LAB` then `ONE` inside it, changes directory, checks DOS `AH=47h`, writes a
-600-byte file, reopens it with `A:\LAB\ONE\TEST.DAT`, verifies the bytes,
-checks that a nonempty directory cannot be removed, deletes the file, and
-removes both directories. Running it twice should succeed if the first run
-completed successfully.
+## API compatibility details and limits
 
-### Shell smoke test
+| INT 21h | Scope in 0.5.0 |
+|:--|:--|
+| AH=1Ah / 2Fh | Set/get DTA address |
+| AH=4Eh / 4Fh | Root or 1-cluster subdir Find First/Next; 8.3 `*` / `?` wildcards; DTA result at offsets 21..42 |
+| AH=43h | File attributes get/set; limited flags; deny updates to open files |
+| AH=57h | FAT file modification time/date read/set for open file handles |
+| AH=36h | FAT12 floppy total/free cluster count, current / A: drive |
+| AH=39h / 3Ah / 3Bh / 47h | Make/remove/change/get directory (from 0.4.0) |
+| AH=3Ch..42h | Basic file creation, open, read/write, close, delete, seek (from 0.3.0) |
+| AH=48h..4Ah | Preliminary single-program DOS conventional memory model (from 0.2.0) |
 
-```text
-MD DEMO
-CD DEMO
-DIR
-CD ..
-RD DEMO
-DIR
-```
+**Limitations:** FAT12 only; only drive A:; directory entries remain limited to
+16 per subdirectory (including `.` and `..`), and 224 at root. FAT directory
+growth and long filenames are **not** implemented. DOS sharing/locking,
+interrupt-driven TSRs, full PSP command lines and environment blocks, batch
+files, device drivers, DPMI, FAT16/32, and complete MZ/COM compatibility are
+future work. The wildcard implementation targets conventional 8.3 DOS
+patterns and does not reproduce all undocumented DOS search quirks. FAT
+metadata writes are not crash-safe or transactional. New files may have zero
+modification dates until the application sets them. Do not use this code on
+important disks or hardware.
 
-The prompt should change between `A:\>` and `A:\DEMO>`. In this version,
-program execution searches the **current directory only**; there is no `PATH`
-search yet, so run `PATHS`, `WRITE`, etc. while at the root.
-
-### Regression tests from 0.3.0
-
-```text
-HELLO
-EXEDEMO
-READ
-MEMORY
-WRITE
-APPEND
-RECHECK
-DELETE
-```
-
-For persistence testing, restart 86Box using the **same writable image** and
-re-run `RECHECK` **before** `DELETE`.
-
-## Implemented DOS API slice
-
-| INT 21h | Feature | Present scope |
-| --- | --- | --- |
-| 39h | Create directory | 8.3, one cluster per directory |
-| 3Ah | Remove directory | Empty, single-cluster, not CWD/ancestor |
-| 3Bh | Change directory | Relative/absolute, max depth 8 |
-| 47h | Get current directory | Current A: drive |
-| 3Ch / 3Dh | Create / open files | 8.3 files inside supported directories |
-| 3Eh | Close | Flush directory/FAT metadata |
-| 3Fh / 40h | Read / write | Data over FAT12 cluster chains |
-| 41h / 42h | Delete / seek | Basic DOS file semantics |
-| 48h–4Ah | Conventional memory | Preliminary single-process MCB manager |
-
-## Known limitations
-
-- **Not safe for valuable disk images or real disks.** FAT copies, file data,
-  and directory metadata are not updated transactionally; interruptions or
-  BIOS write failures can corrupt the filesystem or leak clusters.
-- Non-root directories are fixed at 16 entries (two reserved for `.`/`..`).
-  No directory growth, no long filenames, wildcard searches, or multiple drives.
-- `CD`, `MD`, `RD` accept one unquoted path argument; `DIR` lists the current
-  directory only. The shell does not accept command arguments, execute batches,
-  implement pipes/redirection, search `PATH`, or provide a separate COMMAND.COM.
-- File handles remain limited to four (5–8), and sharing/locking, proper
-  attributes, timestamps, access/error codes, and directory inheritance are
-  incomplete. Read-only and program execution are not yet broadly tested with
-  external DOS binaries.
-- Executables are limited to the current small `.COM` and MZ `.EXE` loader;
-  no full DOS driver model, EMS, XMS, DPMI, TSRs, or 386 protected mode.
-- The boot sector uses a *private 64-sector kernel reservation*, not the
-  conventional DOS system-file boot layout.
-- `AH=30h` returns 6.22 as a compatibility target, **not** a conformance claim.
-- 16-bit 8086 assembly throughout; no Pascal or protected-mode code.
-
-## Repository contents
-
-- `boot/`: 8086 boot sector.
-- `kernel/kernel.s`: real-mode kernel, DOS calls, FAT12 driver.
-- `programs/`: `.COM` / test `.EXE` assembly fixtures.
-- `tools/`: floppy image and MZ fixture builders.
-- `tests/`: offline floppy image regression tests.
-- `docs/ROADMAP.md`: development direction.
+**Verification status:** offline assembly, image-integrity tests, and build
+regression pass. **0.5.0 execution in QEMU/86Box is not verified here**;
+please report the `FINDTEST` result before treating this version as final.
+The 0.4.0 kernel and prior tests were verified by the maintainer in 86Box.
 
 ## License
 
-VelvetDOS source is licensed under **GNU GPLv3-only**, see `COPYING` and source
-`SPDX-License-Identifier: GPL-3.0-only`. No MS-DOS or FreeDOS code is included.
+Copyright (C) 2026 VelvetDOS contributors. Original VelvetDOS source is
+**GNU GPL version 3 only**, `SPDX-License-Identifier: GPL-3.0-only`.
+No Microsoft proprietary source or FreeDOS source has been incorporated.

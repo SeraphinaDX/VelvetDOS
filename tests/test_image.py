@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.4.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.5.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.4.0", kernel)
+        self.assertIn(b"VelvetDOS 0.5.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -143,7 +143,7 @@ class FloppyTest(unittest.TestCase):
     def test_path_parser_compiles_real_backslash_checks(self):
         """GAS treats a single backslash char literal as apostrophe (0x27).
 
-        Catch the exact 0.4.0 bug where LAB\ONE was created as one FAT name.
+        Catch the exact 0.4.0 bug where LAB\\ONE was created as one FAT name.
         Check both the source syntax and the assembled 8086 instructions.
         """
         import re
@@ -160,6 +160,29 @@ class FloppyTest(unittest.TestCase):
         )[0]
         self.assertEqual(len(re.findall(r"\bcmp\s+al,0x5c\b", resolver)), 4)
         self.assertNotRegex(resolver, r"\bcmp\s+al,0x27\b")
+
+    def test_findfirst_dta_and_diskspace_api_binaries(self):
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        for hook in (".L_dos_set_dta:", ".L_dos_get_dta:",
+                     ".L_dos_findfirst:", ".L_dos_findnext:",
+                     ".L_dos_diskfree:", ".L_dos_attributes:",
+                     ".L_dos_timestamp:", "dta_findnext:"):
+            self.assertIn(hook, source)
+        program = (BIN / "FINDTEST.COM").read_bytes()
+        for code in (0x1a, 0x2f, 0x36, 0x4e, 0x4f):
+            self.assertIn(bytes([0xb4, code]), program)
+        for code in (b"ATTR05.TST", b"*.COM", b"*.EXE", b"*.TST"):
+            self.assertIn(code, program)
+        self.assertIn(b"VLIST.COM - DOS FindFirst/FindNext", (BIN / "VLIST.COM").read_bytes())
+
+    def test_new_com_programs_are_in_image(self):
+        names = [
+            self.root[i*32:i*32+11]
+            for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
+        ]
+        for prog in ("FINDTEST.COM", "VLIST.COM"):
+            self.assertIn(mkfloppy.dos_name(prog), names)
+            self.assertGreater((BIN / prog).stat().st_size, 100)
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):
