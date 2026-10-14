@@ -1,7 +1,7 @@
-/* VelvetDOS 0.2.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.3.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
- * Read-only FAT12 root directory; one DOS application at a time.
+ * Writable FAT12 root directory (8.3 only); one DOS application at a time.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -295,7 +295,7 @@ str_eq:
     ret
 
 /* Convert FILENAME[.L_str_eq_EXT] into FAT 8.3 uppercase name.
- * No paths, spaces, switches or command-line arguments in 0.2.0. */
+ * Shell commands still omit paths, spaces, switches or argument tails. */
 prepare_filename:
     push ax
     push bx
@@ -399,6 +399,9 @@ find_file:
     mov word ptr [file_size], ax
     mov ax, word ptr es:[di + 30]
     mov word ptr [file_size_high], ax
+    mov word ptr [file_dir_offset], di
+    mov al, byte ptr es:[di + 11]
+    mov byte ptr [file_attributes], al
     clc
     jmp .L_find_file_exit
 .L_find_file_next:
@@ -626,9 +629,11 @@ reset_mcb:
     mov ax, cs
     mov es, ax
     mov di, offset handles
-    mov cx, 48
+    mov cx, 64
     xor al, al
     rep stosb
+    mov word ptr [rw_cached_sector], 0xffff
+    mov byte ptr [rw_cache_dirty], 0
     mov ax, MEM_MCB
     mov es, ax
     mov byte ptr es:[0], 'Z'
@@ -767,7 +772,7 @@ locate_handle:
     ja .L_lh_err
     sub bx, 5
     push ax
-    mov ax, 12
+    mov ax, 16
     mul bx
     mov bx, ax
     add bx, offset handles
@@ -944,6 +949,7 @@ process_exit:
     mov ss, ax
     mov sp, offset stack_end
     sti
+    call close_all_handles
     jmp shell_loop
 
 /* Minimal, deliberate subset of MS-DOS INT 21h. Unimplemented AH -> CF, AX=1.
@@ -981,12 +987,16 @@ int21_handler:
     je .L_int21_handler_default_drive
     cmp ah, 0x30
     je .L_int21_handler_version
+    cmp ah, 0x3c
+    je .L_dos_create
     cmp ah, 0x3d
     je .L_dos_open
     cmp ah, 0x3e
     je .L_dos_close
     cmp ah, 0x3f
     je .L_dos_read
+    cmp ah, 0x41
+    je .L_dos_delete
     cmp ah, 0x42
     je .L_dos_seek
     cmp ah, 0x48
@@ -1085,65 +1095,127 @@ int21_handler:
     mov ax, 0x1606  /* MS-DOS 6.22 version encoding; compatibility target */
     xor bx, bx
     jmp .L_int21_handler_return
-/* DOS file handle operations. Read-only FAT12 root directory for now.
- * Maximum four file handles (5..8). Standard console handles are separate.
- * AH=3Dh DS:DX ASCIIZ  -> AX handle; AL must be 0 (read-only)
- * AH=3Eh BX           -> close
- * AH=3Fh BX/CX/DS:DX -> AX bytes read, zero at EOF
- * AH=42h AL/BX/CX:DX  -> DX:AX new byte offset.
- * Errors: 2=file not found, 4=too many handles, 5=access denied,
- * 6=invalid handle, 1=invalid seek, 30=read failure.
+/* FAT12 root-only file APIs (four handles: 5..8).
+ * 3Ch create/truncate, 3Dh open R/W, 3Eh close, 3Fh read, 40h write,
+ * 41h delete, 42h seek. No directory paths or sharing yet.
+ * Handle layout: used(0), mode(1), cluster(2), pos(4,6), size(8,10),
+ * root offset(12), padding(14); length 16 bytes.
  */
 .L_dos_open:
-    test al, 3
-    jnz .L_open_denied
-    mov ax, word ptr ss:[bp + 14]  /* caller DS */
+    mov byte ptr [open_mode], al
+    and al, 3
+    cmp al, 3
+    je .L_open_denied
+    mov ax, word ptr ss:[bp + 14]
     mov es, ax
-    mov si, word ptr ss:[bp + 6]   /* caller DX */
+    mov si, word ptr ss:[bp + 6]
     call filename_from_es_si
     jc .L_open_not_found
     call find_file
     jc .L_open_not_found
-    mov si, offset handles
-    mov dx, 5
-.L_open_slot:
-    cmp byte ptr [si], 0
-    je .L_open_found
-    add si, 12
-    inc dx
-    cmp dx, 9
-    jb .L_open_slot
-    mov ax, 4
-    jmp .L_set_error
-.L_open_found:
-    mov byte ptr [si], 1
-    mov ax, word ptr [file_cluster]
-    mov word ptr [si + 2], ax
-    mov word ptr [si + 4], 0
-    mov word ptr [si + 6], 0
-    mov ax, word ptr [file_size]
-    mov word ptr [si + 8], ax
-    mov ax, word ptr [file_size_high]
-    mov word ptr [si + 10], ax
+    test byte ptr [file_attributes], 1
+    jz .L_open_get_slot
+    cmp byte ptr [open_mode], 0
+    jne .L_open_denied
+.L_open_get_slot:
+    call find_handle_slot
+    jc .L_open_no_slots
+    mov al, byte ptr [open_mode]
+    and al, 3
+    mov byte ptr [si + 1], al
+    call fill_handle
     mov ax, dx
     jmp .L_int21_handler_return
 .L_open_denied:
     mov ax, 5
     jmp .L_set_error
+.L_open_no_slots:
+    mov ax, 4
+    jmp .L_set_error
 .L_open_not_found:
     mov ax, 2
+    jmp .L_set_error
+/* DOS 3Ch creates or truncates an 8.3 root file. CX=attributes.
+ * Existing read-only files are protected. A new file is empty and has
+ * first cluster 0 until the first successful allocation.
+ */
+.L_dos_create:
+    mov ax, word ptr ss:[bp + 8]
+    test ax, 0xffdf  /* allow ordinary or archive attributes only */
+    jnz .L_open_denied
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call filename_from_es_si
+    jc .L_open_denied
+    call find_handle_slot
+    jc .L_open_no_slots
+    mov word ptr [new_handle], si
+    mov word ptr [new_handle_number], dx
+    call find_file
+    jc .L_create_new
+    test byte ptr [file_attributes], 1
+    jnz .L_open_denied
+    /* Safeguard against truncating a file opened by another handle. */
+    call root_is_open
+    jc .L_open_denied
+    call free_file_chain
+    jc .L_write_failure
+    jmp .L_create_initialize
+.L_create_new:
+    call find_free_root
+    jc .L_create_full
+.L_create_initialize:
+    mov ax, ROOT_SEG
+    mov es, ax
+    mov di, word ptr [file_dir_offset]
+    push di
+    mov cx, 16
+    xor ax, ax
+    rep stosw
+    pop di
+    mov si, offset filename
+    mov cx, 11
+.L_create_copy_name:
+    mov al, byte ptr [si]
+    mov byte ptr es:[di], al
+    inc si
+    inc di
+    loop .L_create_copy_name
+    mov ax, word ptr ss:[bp + 8]
+    or al, 0x20 /* archive */
+    mov byte ptr es:[di], al
+    mov word ptr [file_cluster], 0
+    mov word ptr [file_size], 0
+    mov word ptr [file_size_high], 0
+    mov si, word ptr [new_handle]
+    mov dx, word ptr [new_handle_number]
+    mov byte ptr [si + 1], 2 /* read/write */
+    call fill_handle
+    mov byte ptr [fs_dirty], 1
+    call flush_metadata
+    jc .L_write_failure
+    mov ax, dx
+    jmp .L_int21_handler_return
+.L_create_full:
+    mov ax, 4 /* root directory full */
     jmp .L_set_error
 .L_dos_close:
     mov bx, word ptr ss:[bp + 10]
     call locate_handle
     jc .L_invalid_handle
+    call update_root_handle
     mov byte ptr [bx], 0
+    call flush_metadata
+    jc .L_write_failure
     xor ax, ax
     jmp .L_int21_handler_return
 .L_dos_read:
     mov bx, word ptr ss:[bp + 10]
     call locate_handle
     jc .L_invalid_handle
+    cmp byte ptr [bx + 1], 1 /* write-only */
+    je .L_open_denied
     mov word ptr [rw_handle], bx
     mov ax, word ptr ss:[bp + 14]
     mov word ptr [rw_dstseg], ax
@@ -1157,7 +1229,6 @@ int21_handler:
     cmp word ptr [rw_remaining], 0
     je .L_read_done
     mov bx, word ptr [rw_handle]
-    /* EOF if position >= length, unsigned 32-bit compare. */
     mov ax, word ptr [bx + 6]
     cmp ax, word ptr [bx + 10]
     ja .L_read_done
@@ -1185,6 +1256,116 @@ int21_handler:
     jmp .L_int21_handler_return
 .L_read_disk_error:
     mov ax, 30
+    jmp .L_set_error
+/* DOS AH=41h remove root file, releasing its FAT cluster chain. */
+.L_dos_delete:
+    mov ax, word ptr ss:[bp + 14]
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]
+    call filename_from_es_si
+    jc .L_open_not_found
+    call find_file
+    jc .L_open_not_found
+    test byte ptr [file_attributes], 1
+    jnz .L_open_denied
+    call root_is_open
+    jc .L_open_denied
+    call free_file_chain
+    jc .L_write_failure
+    mov ax, ROOT_SEG
+    mov es, ax
+    mov di, word ptr [file_dir_offset]
+    mov byte ptr es:[di], 0xe5
+    mov byte ptr [fs_dirty], 1
+    call flush_metadata
+    jc .L_write_failure
+    xor ax, ax
+    jmp .L_int21_handler_return
+/* DOS AH=40h write to file. No sparse seeks yet: a write when current
+ * position > EOF fails rather than exposing uninitialized clusters.
+ */
+.L_dos_write:
+    mov bx, word ptr ss:[bp + 10]
+    call locate_handle
+    jc .L_invalid_handle
+    cmp byte ptr [bx + 1], 0
+    je .L_open_denied
+    mov word ptr [rw_handle], bx
+    mov ax, word ptr ss:[bp + 14]
+    mov word ptr [rw_dstseg], ax
+    mov ax, word ptr ss:[bp + 6]
+    mov word ptr [rw_dstoff], ax
+    mov ax, word ptr ss:[bp + 8]
+    mov word ptr [rw_remaining], ax
+    mov word ptr [rw_read], 0
+    mov word ptr [rw_cached_sector], 0xffff
+    mov byte ptr [write_errno], 0
+.L_write_next:
+    cmp word ptr [rw_remaining], 0
+    je .L_write_finish
+    mov bx, word ptr [rw_handle]
+    /* only allow writing at/before logical EOF */
+    mov ax, word ptr [bx + 6]
+    cmp ax, word ptr [bx + 10]
+    ja .L_write_bad_seek
+    jb .L_write_copy
+    mov ax, word ptr [bx + 4]
+    cmp ax, word ptr [bx + 8]
+    ja .L_write_bad_seek
+.L_write_copy:
+    push es
+    mov ax, word ptr [rw_dstseg]
+    mov es, ax
+    mov si, word ptr [rw_dstoff]
+    mov al, byte ptr es:[si]
+    pop es
+    call write_file_byte
+    jc .L_write_partial_or_error
+    inc word ptr [rw_dstoff]
+    inc word ptr [rw_read]
+    dec word ptr [rw_remaining]
+    add word ptr [bx + 4], 1
+    adc word ptr [bx + 6], 0
+    /* grow logical EOF if the new position passed it */
+    mov ax, word ptr [bx + 6]
+    cmp ax, word ptr [bx + 10]
+    jb .L_write_next
+    ja .L_write_grow
+    mov ax, word ptr [bx + 4]
+    cmp ax, word ptr [bx + 8]
+    jbe .L_write_next
+.L_write_grow:
+    mov ax, word ptr [bx + 4]
+    mov word ptr [bx + 8], ax
+    mov ax, word ptr [bx + 6]
+    mov word ptr [bx + 10], ax
+    jmp .L_write_next
+.L_write_bad_seek:
+    mov byte ptr [write_errno], 1
+.L_write_partial_or_error:
+    /* A full disk returns a short successful write (AX < CX) if
+     * anything was written; otherwise AX=0, CF clear. */
+    cmp byte ptr [write_errno], 39
+    jne .L_write_failed
+    jmp .L_write_finish
+.L_write_failed:
+    mov al, byte ptr [write_errno]
+    xor ah, ah
+    push ax
+    call flush_write_cache
+    pop ax
+    jmp .L_set_error
+.L_write_finish:
+    call flush_write_cache
+    jc .L_write_failure
+    mov bx, word ptr [rw_handle]
+    call update_root_handle
+    /* Deliberately defer FAT/root sync until close (or normal exit).
+     * Data sectors are persisted on every successful AH=40h call. */
+    mov ax, word ptr [rw_read]
+    jmp .L_int21_handler_return
+.L_write_failure:
+    mov ax, 29 /* write fault */
     jmp .L_set_error
 .L_dos_seek:
     mov byte ptr [rw_mode], al
@@ -1414,7 +1595,10 @@ int21_handler:
     cmp bx, 1
     je .L_int21_handler_wh_ok
     cmp bx, 2
-    jne .L_int21_handler_not_supported
+    je .L_int21_handler_wh_ok
+    cmp bx, 5
+    jae .L_dos_write
+    jmp .L_int21_handler_not_supported
 .L_int21_handler_wh_ok:
     mov ax, word ptr ss:[bp + 14]
     mov es, ax
@@ -1448,7 +1632,490 @@ int21_handler:
     pop ds
     iret
 
-/* Preload FAT #1 and root directory into memory (disk is read-only). */
+/* Find first unused DOS handle. Returns SI=record and DX=5..8, CF clear;
+ * all other registers preserved. */
+find_handle_slot:
+    mov si, offset handles
+    mov dx, 5
+.L_fhs_loop:
+    cmp byte ptr [si], 0
+    je .L_fhs_found
+    add si, 16
+    inc dx
+    cmp dx, 9
+    jb .L_fhs_loop
+    stc
+    ret
+.L_fhs_found:
+    clc
+    ret
+
+/* Fill a handle after mode has been assigned and find_file called.
+ * SI=record; preserves AX, DX. */
+fill_handle:
+    mov byte ptr [si], 1
+    mov ax, word ptr [file_cluster]
+    mov word ptr [si + 2], ax
+    mov word ptr [si + 4], 0
+    mov word ptr [si + 6], 0
+    mov ax, word ptr [file_size]
+    mov word ptr [si + 8], ax
+    mov ax, word ptr [file_size_high]
+    mov word ptr [si + 10], ax
+    mov ax, word ptr [file_dir_offset]
+    mov word ptr [si + 12], ax
+    ret
+
+/* Locate a free 32-byte root-directory slot. No subdirectories. */
+find_free_root:
+    push ax
+    push cx
+    push di
+    push es
+    mov ax, ROOT_SEG
+    mov es, ax
+    xor di, di
+    mov cx, ROOT_ENTRIES
+.L_ffr_loop:
+    cmp byte ptr es:[di], 0
+    je .L_ffr_found
+    cmp byte ptr es:[di], 0xe5
+    je .L_ffr_found
+    add di, 32
+    loop .L_ffr_loop
+    stc
+    jmp .L_ffr_exit
+.L_ffr_found:
+    mov word ptr [file_dir_offset], di
+    clc
+.L_ffr_exit:
+    pop es
+    pop di
+    pop cx
+    pop ax
+    ret
+
+/* Reject truncate/delete when the target directory slot is still open. */
+root_is_open:
+    push ax
+    push bx
+    push cx
+    mov bx, offset handles
+    mov cx, 4
+    mov ax, word ptr [file_dir_offset]
+.L_rio_loop:
+    cmp byte ptr [bx], 0
+    je .L_rio_next
+    cmp word ptr [bx + 12], ax
+    je .L_rio_busy
+.L_rio_next:
+    add bx, 16
+    loop .L_rio_loop
+    clc
+    jmp .L_rio_exit
+.L_rio_busy:
+    stc
+.L_rio_exit:
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Assign 12-bit FAT entry. AX=cluster, DX=value (0..0xfff).
+ * Preserves registers, does not flush FAT to disk. */
+fat_set:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    mov bx, ax
+    shr bx, 1
+    add bx, ax
+    mov cx, FAT_SEG
+    mov es, cx
+    test ax, 1
+    jnz .L_fset_odd
+    mov ax, word ptr es:[bx]
+    and ax, 0xf000
+    and dx, 0x0fff
+    or ax, dx
+    mov word ptr es:[bx], ax
+    jmp .L_fset_done
+.L_fset_odd:
+    mov ax, word ptr es:[bx]
+    and ax, 0x000f
+    and dx, 0x0fff
+    mov cl, 4
+    shl dx, cl
+    or ax, dx
+    mov word ptr es:[bx], ax
+.L_fset_done:
+    mov byte ptr [fs_dirty], 1
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Return AX=allocated free cluster, CF=0; full disk => CF=1.
+ * No clustering hints or free-space cache in this first implementation. */
+allocate_cluster:
+    push bx
+    push dx
+    mov bx, 2
+.L_ac_loop:
+    mov ax, bx
+    call fat_next
+    test ax, ax
+    je .L_ac_found
+    inc bx
+    cmp bx, 2784
+    jbe .L_ac_loop
+    stc
+    jmp .L_ac_done
+.L_ac_found:
+    mov ax, bx
+    mov dx, 0x0fff
+    call fat_set
+    mov ax, bx
+    clc
+.L_ac_done:
+    pop dx
+    pop bx
+    ret
+
+/* Free an existing file's FAT chain. Called for truncate/delete.
+ * Guards against bad cluster values and loops (maximum 2783 hops). */
+free_file_chain:
+    push ax
+    push bx
+    push cx
+    push dx
+    mov bx, word ptr [file_cluster]
+    mov cx, 2783
+    cmp bx, 0
+    je .L_ffc_done
+.L_ffc_next:
+    cmp bx, 2
+    jb .L_ffc_bad
+    cmp bx, 2784
+    ja .L_ffc_bad
+    mov ax, bx
+    call fat_next
+    mov word ptr [free_next], ax
+    mov ax, bx
+    xor dx, dx
+    call fat_set
+    mov bx, word ptr [free_next]
+    cmp bx, 0x0ff8
+    jae .L_ffc_done
+    loop .L_ffc_next
+.L_ffc_bad:
+    stc
+    jmp .L_ffc_exit
+.L_ffc_done:
+    clc
+.L_ffc_exit:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Mirror in-memory FAT to both FAT copies and root directory to disk.
+ * Metadata changes are deferred until close or process exit. Failure
+ * does not clear fs_dirty; this is NOT yet a transactional filesystem. */
+flush_metadata:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push es
+    cmp byte ptr [fs_dirty], 0
+    je .L_fmd_ok
+    mov ax, FAT_SEG
+    mov es, ax
+    xor bx, bx
+    mov si, 65
+    mov cx, 9
+.L_fmd_fat1:
+    push cx
+    mov ax, si
+    call write_sector
+    pop cx
+    jc .L_fmd_fail
+    add bx, 512
+    inc si
+    loop .L_fmd_fat1
+    xor bx, bx
+    mov si, 74
+    mov cx, 9
+.L_fmd_fat2:
+    push cx
+    mov ax, si
+    call write_sector
+    pop cx
+    jc .L_fmd_fail
+    add bx, 512
+    inc si
+    loop .L_fmd_fat2
+    mov ax, ROOT_SEG
+    mov es, ax
+    xor bx, bx
+    mov si, ROOT_SECTOR
+    mov cx, ROOT_SECTORS
+.L_fmd_root:
+    push cx
+    mov ax, si
+    call write_sector
+    pop cx
+    jc .L_fmd_fail
+    add bx, 512
+    inc si
+    loop .L_fmd_root
+    mov byte ptr [fs_dirty], 0
+.L_fmd_ok:
+    clc
+    jmp .L_fmd_exit
+.L_fmd_fail:
+    stc
+.L_fmd_exit:
+    pop es
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* A writable handle owns its in-memory root entry size/first cluster.
+ * Called after write and before close. Preserves all registers. */
+update_root_handle:
+    push ax
+    push di
+    push es
+    cmp byte ptr [bx], 0
+    je .L_urh_done
+    cmp byte ptr [bx + 1], 0
+    je .L_urh_done
+    mov ax, ROOT_SEG
+    mov es, ax
+    mov di, word ptr [bx + 12]
+    mov ax, word ptr [bx + 2]
+    mov word ptr es:[di + 26], ax
+    mov ax, word ptr [bx + 8]
+    mov word ptr es:[di + 28], ax
+    mov ax, word ptr [bx + 10]
+    mov word ptr es:[di + 30], ax
+    mov byte ptr [fs_dirty], 1
+.L_urh_done:
+    pop es
+    pop di
+    pop ax
+    ret
+
+/* Called when application returns without closing all its handles. */
+close_all_handles:
+    push ax
+    push bx
+    push cx
+    mov bx, offset handles
+    mov cx, 4
+.L_cah_loop:
+    call update_root_handle
+    mov byte ptr [bx], 0
+    add bx, 16
+    loop .L_cah_loop
+    call flush_metadata
+    jnc .L_cah_ok
+    mov si, offset sync_error_message
+    call print_z
+.L_cah_ok:
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Persist buffered file content from IO_SEG to its allocated cluster. */
+flush_write_cache:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    cmp byte ptr [rw_cache_dirty], 0
+    je .L_fwc_ok
+    mov ax, IO_SEG
+    mov es, ax
+    xor bx, bx
+    mov ax, word ptr [rw_cached_cluster]
+    add ax, DATA_BIAS
+    call write_sector
+    jc .L_fwc_fail
+    mov byte ptr [rw_cache_dirty], 0
+.L_fwc_ok:
+    clc
+    jmp .L_fwc_exit
+.L_fwc_fail:
+    stc
+.L_fwc_exit:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Append/overwrite one byte in file, returning CF on failure.
+ * Pos+size changes are performed by the AH=40h caller. Newly allocated
+ * clusters are zero-filled to avoid writing stale disk data.
+ */
+write_file_byte:
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+    mov byte ptr [rw_saved_byte], al
+    mov ax, word ptr [bx + 6]
+    mov cl, 7
+    shl ax, cl
+    mov dx, word ptr [bx + 4]
+    mov cl, 9
+    shr dx, cl
+    or ax, dx
+    mov word ptr [rw_saved_ordinal], ax
+    cmp ax, word ptr [rw_cached_sector]
+    jne .L_wfb_new_sector
+    cmp bx, word ptr [rw_cached_handle]
+    je .L_wfb_copy
+.L_wfb_new_sector:
+    call flush_write_cache
+    jc .L_wfb_io_err
+    mov word ptr [rw_cached_sector], 0xffff
+    mov byte ptr [rw_new_cluster], 0
+    mov si, word ptr [rw_saved_ordinal]
+    mov dx, word ptr [bx + 2]
+    test dx, dx
+    jnz .L_wfb_follow
+    test si, si
+    jnz .L_wfb_io_err
+    call allocate_cluster
+    jc .L_wfb_full
+    mov word ptr [bx + 2], ax
+    mov dx, ax
+    mov byte ptr [rw_new_cluster], 1
+.L_wfb_follow:
+    test si, si
+    jz .L_wfb_found
+    cmp dx, 2
+    jb .L_wfb_io_err
+    cmp dx, 2784
+    ja .L_wfb_io_err
+    mov ax, dx
+    call fat_next
+    cmp ax, 0xff8
+    jb .L_wfb_existing_next
+    mov word ptr [rw_prev_cluster], dx
+    call allocate_cluster
+    jc .L_wfb_full
+    mov word ptr [rw_alloc_new], ax
+    mov dx, ax
+    mov ax, word ptr [rw_prev_cluster]
+    call fat_set
+    mov dx, word ptr [rw_alloc_new]
+    mov byte ptr [rw_new_cluster], 1
+    jmp .L_wfb_advance
+.L_wfb_existing_next:
+    mov dx, ax
+.L_wfb_advance:
+    dec si
+    jmp .L_wfb_follow
+.L_wfb_found:
+    cmp dx, 2
+    jb .L_wfb_io_err
+    cmp dx, 2784
+    ja .L_wfb_io_err
+    mov word ptr [rw_cached_cluster], dx
+    mov ax, IO_SEG
+    mov es, ax
+    cmp byte ptr [rw_new_cluster], 0
+    jne .L_wfb_zero
+    xor bx, bx
+    mov ax, dx
+    add ax, DATA_BIAS
+    call read_sector
+    jc .L_wfb_io_err
+    jmp .L_wfb_ready
+.L_wfb_zero:
+    xor di, di
+    xor ax, ax
+    mov cx, 256
+    rep stosw
+.L_wfb_ready:
+    mov ax, word ptr [rw_saved_ordinal]
+    mov word ptr [rw_cached_sector], ax
+    mov ax, word ptr [rw_handle]
+    mov word ptr [rw_cached_handle], ax
+.L_wfb_copy:
+    mov ax, IO_SEG
+    mov es, ax
+    mov bx, word ptr [rw_handle]
+    mov si, word ptr [bx + 4]
+    and si, 511
+    mov al, byte ptr [rw_saved_byte]
+    mov byte ptr es:[si], al
+    mov byte ptr [rw_cache_dirty], 1
+    clc
+    jmp .L_wfb_exit
+.L_wfb_full:
+    mov byte ptr [write_errno], 39
+    stc
+    jmp .L_wfb_exit
+.L_wfb_io_err:
+    mov byte ptr [write_errno], 29
+    stc
+.L_wfb_exit:
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+/* AX=LBA, ES:BX=512-byte source; CF indicates BIOS write failure. */
+write_sector:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    xor dx, dx
+    mov cx, 18
+    div cx
+    mov cx, dx
+    inc cl
+    xor dx, dx
+    mov si, 2
+    div si
+    mov ch, al
+    mov dh, dl
+    mov dl, byte ptr [boot_drive]
+    mov ax, 0x0301
+    int 0x13
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* Preload FAT #1 and root directory into memory. */
 load_tables:
     mov ax, FAT_SEG
     mov es, ax
@@ -1533,7 +2200,27 @@ rw_read:           .word 0
 rw_cached_sector:  .word 0xffff
 rw_mode:           .byte 0
 .align 2
-handles:           .space 48  /* 4 x 12-byte read-only handle records */
+handles:           .space 64  /* 4 x 16-byte read/write handle records */
+open_mode:         .byte 0
+file_attributes:   .byte 0
+fs_dirty:          .byte 0
+rw_cache_dirty:    .byte 0
+rw_new_cluster:    .byte 0
+write_errno:       .byte 0
+.align 2
+file_dir_offset:   .word 0
+new_handle:        .word 0
+new_handle_number: .word 0
+rw_cached_handle:  .word 0
+rw_cached_cluster: .word 0
+rw_saved_ordinal:  .word 0
+rw_saved_byte:     .byte 0
+.align 2
+rw_prev_cluster:   .word 0
+rw_alloc_new:      .word 0
+free_next:         .word 0
+sync_error_message: .asciz "WARNING: disk metadata sync failed.\r\n"
+.align 2
 exe_hdrparas:      .word 0
 exe_hdrbytes:       .word 0
 exe_reloc_remaining:.word 0
@@ -1547,14 +2234,14 @@ file_size:          .word 0
 file_size_high:     .word 0
 filename:           .space 11
 cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.2.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.3.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\>"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
 cmd_ver:            .asciz "VER"
 cmd_cls:            .asciz "CLS"
 cmd_reboot:         .asciz "REBOOT"
-help_text:          .asciz "Commands: HELP, DIR, VER, CLS, REBOOT\r\nRun root .COM or small MZ .EXE programs by name.\r\nOnly read-only FAT12 and a subset of INT 21h work.\r\n"
+help_text:          .asciz "Commands: HELP, DIR, VER, CLS, REBOOT\r\nRun root .COM or small MZ .EXE programs by name.\r\nFAT12 root 8.3 file writes and subset of INT 21h supported.\r\n"
 dir_header:         .asciz "Root directory:\r\n"
 bad_command_message:.asciz "Bad command or file name.\r\n"
 load_error_message: .asciz "Unable to load DOS program (format, size or disk error).\r\n"

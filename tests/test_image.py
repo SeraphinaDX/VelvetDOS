@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.2.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.3.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.2.0", kernel)
+        self.assertIn(b"VelvetDOS 0.3.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -45,7 +45,8 @@ class FloppyTest(unittest.TestCase):
 
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
-                 "READ.COM", "MEMORY.COM", "README.TXT")
+                 "READ.COM", "MEMORY.COM", "README.TXT",
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -64,8 +65,11 @@ class FloppyTest(unittest.TestCase):
             self.assertEqual(recovered[:len(original)], original)
 
     def test_dos_com_examples_have_valid_binary_headers(self):
-        for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM"):
-            self.assertTrue((BIN / name).read_bytes().startswith(b"\xba"), name)
+        for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM"):
+            # Regressions are independently linked native .COM files; their first
+            # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
+            self.assertGreater((BIN / name).stat().st_size, 30, name)
         # MEMORY starts with PUSH DS (1Eh), then POP ES (07h).
         self.assertTrue((BIN / "MEMORY.COM").read_bytes().startswith(b"\x1e\x07"))
 
@@ -95,6 +99,28 @@ class FloppyTest(unittest.TestCase):
         self.assertEqual(fat_next(self.fat, cluster), 5)
         self.assertEqual(fat_next(self.fat, 5), 6)
         self.assertEqual(fat_next(self.fat, 6), 0xfff)
+
+    def test_write_fixtures_are_native_com_programs(self):
+        for name, expected in (("WRITE.COM", b"WRITE.COM:"),
+                               ("APPEND.COM", b"APPEND.COM:"),
+                               ("DELETE.COM", b"DELETE.COM:"),
+                               ("RECHECK.COM", b"RECHECK.COM:")):
+            blob = (BIN / name).read_bytes()
+            self.assertIn(expected, blob)
+            self.assertIn(b"DATA.BIN\x00", blob)
+            self.assertNotEqual(blob[:2], b"MZ")
+        self.assertIn(b"A" * 512 + b"B" * 188,
+                      (BIN / "WRITE.COM").read_bytes())
+
+    def test_write_api_bios_and_fat12_implementation_present(self):
+        # Structural checks only. Emulator still needs to execute the programs.
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        for routine in ("write_sector:", "flush_metadata:",
+                        "allocate_cluster:", "fat_set:",
+                        "write_file_byte:", "free_file_chain:"):
+            self.assertIn(routine, source)
+        self.assertIn("mov ax, 0x0301", source)
+        self.assertIn("mov si, 74", source)  # FAT mirror
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):

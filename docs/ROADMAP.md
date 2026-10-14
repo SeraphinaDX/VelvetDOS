@@ -1,40 +1,37 @@
 # VelvetDOS compatibility roadmap
 
-## 0.1.0 — minimal real-mode foundation
+## 0.1.0 — bootable foundation (86Box-validated)
 
-Bootable 1.44 MB FAT12 disk, source-built kernel, command loop, read-only root
-file access, basic INT 21h and COM launching. Includes test programs.
+Native FAT12 floppy boot, console, COM loader and basic INT 21h subset.
 
-## 0.2.0 — early DOS runtime (in progress)
+## 0.2.0 — initial DOS runtime (86Box-validated)
 
-Deliver initial read-only file handles (open/read/seek/close), a bounded small
-MZ `.EXE` loader, and provisional MCB allocate/free/resize. Improve these into
-fully DOS-compatible behaviors incrementally. Still **to do**: general MZ
-loaders, PSP/environment/exit semantics, DTA and find-first/find-next,
-FAT12/FAT16 directories and writable files, richer DOS error handling.
+Small MZ executables with relocations, root file read/open/seek/close,
+preliminary conventional-memory MCB allocation.
 
-Do not mark this milestone complete until the new demos pass in 86Box.
+## 0.3.0 — writable FAT12 files (development preview)
 
-## 0.3.0 — everyday DOS shell
+Support file creation, sequential and random overwrite, append, delete,
+FAT cluster allocation/release, and matching DOS file APIs. Provide a
+703-byte persistent cross-cluster regression through 86Box.
 
-Implement DOS-compatible COMMAND.COM execution (internal/external commands,
-command tails, batch files, PATH, redirection/pipes, environment variables),
-writeable FAT with consistency checks, subdirectories and timestamps.
+**Outstanding:** 86Box regression, error-handling hardening, power-loss
+resilience and full DOS compatibility.
 
-## 0.4.0 — drivers and resident applications
+## 0.4.0 — DOS directories and everyday utility compatibility
 
-DOS device chains, request packets, CONFIG.SYS-style installation, TSRs,
-interrupt chaining, appropriate critical-error handling, and printer/serial IO.
+Subdirectories/CD/MD/RD, DOS find-first/find-next, directory enumeration,
+DTA, timestamps, more complete file attributes, 8.3 paths, command-line
+tails, PSP and environment block support; begin independently compiled apps.
 
-## 0.5.0 — larger DOS software and games
+## 0.5.0 — command interpreter and system integration
 
-XMS, EMS, upper-memory support, DPMI cooperation and DOS extenders, plus
-hardware/BIOS behavior regression testing under 86Box and QEMU.
+Standalone COMMAND.COM, batch files, PATH, redirection, pipes, file sharing,
+optional CONFIG.SYS-style drivers and DOS system-call improvements.
 
-## 1.0.0 — measured compatibility target
+## Later — real-mode compatibility, protected-mode extensions
 
-Publish a reproducible compatibility suite and verified application/game
-matrix, with clearly documented unsupported and hardware-dependent cases.
-
-No version implies automatic compatibility with every program: DOS behavior
-includes undocumented interfaces and hardware/software interaction quirks.
+DOS device chains, TSRs, EMS/XMS/UMB, then 386 DPMI/DOS extender support.
+Only consider Free Pascal tools for 386 extended-mode programs after DPMI is
+verified. Track known games and applications in a reproducible 86Box/QEMU test
+matrix. Self-hosting is a long-term goal, not a 0.x promise.

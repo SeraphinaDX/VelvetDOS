@@ -1,110 +1,112 @@
-# VelvetDOS 0.2.0 (development preview)
+# VelvetDOS 0.3.0 (development preview)
 
-VelvetDOS is a new GNU GPLv3-licensed project aiming for **binary compatibility
-with DOS software** on IBM PC-compatible x86 computers. This milestone is a
-proof-of-concept real-mode floppy OS, **not yet a full MS-DOS replacement**.
+VelvetDOS is an experimental **GNU GPLv3** 8086 real-mode DOS-compatible operating
+system. The 0.3.0 milestone adds **writable FAT12 root-directory files**,
+building on 0.2.0's 86Box-tested COM/MZ executable loading, read-only DOS file
+handles and preliminary memory management. **It is not a complete MS-DOS
+replacement** and should run only against disposable disk images.
 
-## What works in this development preview
+## New in 0.3.0
 
-All VelvetDOS 0.1.0 bootloader, FAT12, shell and `.COM` support remains.
-The 0.2.0 preview adds:
+- BIOS-backed FAT12 **file creation, truncation, writing, and deletion** in the
+  floppy root directory (`INT 21h AH=3Ch`, `40h`, `41h`).
+- Read/write file handles (`AH=3Dh` modes 0, 1, and 2); file close (`3Eh`),
+  reads (`3Fh`), and seek (`42h`) share the same 8.3 filename and FAT chain.
+- Sector-buffered writes with allocation of additional FAT12 clusters;
+  zero-initialize newly allocated sectors rather than copying old disk data.
+- Flush file contents after each successful `AH=40h`. Persist both FAT copies
+  and the root directory on close or normal program termination.
+- `WRITE.COM`, `APPEND.COM`, `RECHECK.COM`, and `DELETE.COM` regression programs,
+  along with the previous 0.1/0.2 tests.
 
-- **Small MZ `.EXE` loading** with header validation and relocation fixing,
-  limited to a single 64 KiB image loaded from the floppy root directory.
-  Bare shell names search `.COM` before `.EXE`.
-- **Read-only DOS file handles** through `INT 21h`: `AH=3Dh` (open),
-  `3Eh` (close), `3Fh` (read), and `42h` (seek). Four concurrent file handles
-  numbered 5 through 8; no folders or disk writes.
-- **A basic MCB conventional-memory chain** with `AH=48h` (allocate),
-  `49h` (free), and `4Ah` (resize). Programs own their initial memory block
-  and generally must shrink it before they can allocate additional blocks.
-- Additional test programs: `EXEDEMO.EXE` (relocation), `READ.COM`
-  (open/read/seek/close across FAT12 sectors), `MEMORY.COM` (MCBs), and a
-  multi-sector `README.TXT` fixture.
+**Verification:** assembly and disk image build successfully and the automated
+image integrity tests pass. **86Box/runtime execution of the 0.3.0 changes has
+not yet been verified.** The prior version (0.2.0) was tested by the project
+owner in 86Box.
 
-The entire boot/kernel/application foundation remains 8086 real-mode
-assembly. **No Pascal or protected-mode dependency has been introduced.**
+## Build on Linux
 
-**Verification boundary:** the floppy image builds with GNU binutils, and
-structural and packer tests run locally. We cannot claim 0.2.0 works in 86Box
-until the interactive programs are actually tested there.
-
-## Requirements (Linux)
-
-- GNU Make, GNU binutils (`as`, `ld`), Python 3.
-- QEMU (`qemu-system-i386`) **to actually run** the image.
-
-The kernel is currently **entirely 16-bit x86 assembly** so this early
-milestone needs no particular 16-bit C compiler. Future kernels can incorporate
-16-bit C via a toolchain such as Open Watcom.
-
-## Build and run
+Requires GNU Make, GNU binutils (`as`, `ld`), Python 3. QEMU is optional; you
+can use 86Box to boot the image instead.
 
 ```sh
-make image
-make test
-make run
+make clean test
+make run  # if QEMU is installed
 ```
 
-`make run` boots from the generated `build/velvetdos-0.2.0.img`.
-You can also use:
+Output: `build/velvetdos-0.3.0.img` (1.44 MB). Mount/boot **a writable copy**
+in 86Box; leave the image unprotected, or BIOS writes will fail.
 
-```sh
-qemu-system-i386 -drive file=build/velvetdos-0.2.0.img,if=floppy,format=raw -boot a -m 16
-```
+### Manual regression in 86Box
 
-At the `A:\>` prompt, try:
+At `A:\>` enter, in order:
 
-```
-HELP
-DIR
-VER
+```text
 HELLO
-RETURN
-CHAIN
 EXEDEMO
 READ
 MEMORY
-CLS
+WRITE
+DIR
+APPEND
+RECHECK
 ```
 
-The build does **not** modify your computer's disks. Do not write this
-experimental boot image to a physical drive containing anything important.
+`WRITE` creates `DATA.BIN` and tests a 700-byte cross-cluster write/read;
+`APPEND` reopens it for read/write, seeks to EOF and adds `XYZ`;
+`RECHECK` verifies the complete 703 bytes. The programs print PASS/FAIL.
 
-## Important limitations
+For a **persistence test**, shut down the emulator after `APPEND`, boot the
+*same writable disk image again*, then run `RECHECK`. Run `DELETE` to remove
+`DATA.BIN`, then `DIR` to confirm it is gone. Avoid mounting a fresh image or
+configuring 86Box to discard writes, or the persistence test will fail.
 
-**This is a pre-alpha, not a general DOS-compatible release.** Many DOS
-programs will not run. The new MZ loader only accepts simple real-mode
-executables that fit inside one 64 KiB image; large/multisegment MZ programs,
-DOS overlays and protected-mode extenders are not supported.
+## DOS API coverage (partial)
 
-- No subdirectories, file creation/writes, file sharing or device-file opens.
-- No command-line argument tails, batch files, pipes, environment blocks,
-  DOS path search, standard input redirection, or a standalone `COMMAND.COM`.
-- The MCB implementation is provisional; no TSRs, resident drivers, EMS, XMS,
-  UMBs, DPMI or full DOS process inheritance semantics.
-- Disk access is BIOS CHS, 1.44 MB FAT12 and drive A: only.
-- Many `INT 21h` calls, DOS internals, hardware protocols, and disk errors
-  are still unsupported or simplified. BIOS and VGA behavior vary by emulator.
-- `INT 21h AH=30h` advertises DOS 6.22 solely as a compatibility target, not
-  an assertion of actual DOS 6.22 compatibility.
-- The experimental boot format reserves 64 post-boot sectors for the kernel;
-  it does not match Microsoft's DOS system boot layout.
+| INT 21h | Purpose | Current scope |
+|---|---|---|
+| AH=3Ch | Create/truncate file | Root 8.3 only, ordinary/archive attributes |
+| AH=3Dh | Open file | 4 concurrent handles (5–8), read/write modes |
+| AH=3Eh | Close handle | Flush root/FAT metadata |
+| AH=3Fh | Read | File data across FAT12 sectors |
+| AH=40h | Write | File data plus stdout/stderr console output |
+| AH=41h | Delete | Unlink root file and free FAT chain |
+| AH=42h | Seek | Absolute/current/EOF; no sparse writes |
+| AH=48–4Ah | Memory allocation | Provisional single-process MCB implementation |
 
-Do not overwrite an existing disk with this experimental image.
+## Known limitations and risks
 
-## Repository layout
+- **Do not use on real storage or valuable floppy images.** FAT copies and root
+  directory are written separately and **not transactionally**. Disk failure,
+  forced shutdown, or interruption while updating metadata can corrupt the
+  FAT12 filesystem. A dedicated 86Box/QEMU *copy* is essential.
+- Root directory only; no `CD`, `MD`, `RD`, folder traversal, FAT16/32,
+  date/time stamps, LFN, file sharing or locking.
+- No sparse files: writing after seeking past EOF returns a seek error.
+  Zero-byte `AH=40h` file truncation is not implemented.
+- Access modes and error codes are incomplete; no full DOS attributes,
+  permission/share semantics, or file handle inheritance. A file cannot be
+  deleted/truncated while it is open by another handle.
+- The built-in shell still has no batch processing, paths, command-line
+  arguments, pipes, redirection, environment blocks, or standalone COMMAND.COM.
+- Small one-segment MZ loader only; no TSRs, DOS device drivers, DPMI,
+  protected-mode DOS extenders, full EXE relocation/loading or DOS API coverage.
+- Bootstraps from a private 64-sector kernel reservation on the FAT12 disk,
+  not a standard MS-DOS boot/system-file layout.
+- `AH=30h` reports an MS-DOS 6.22 *compatibility target*, not full conformance.
+- Remains entirely 16-bit 8086 assembly, **no Pascal or protected-mode code**.
 
-- `boot/boot.s`: FAT12 BIOS bootloader, 64-sector fixed-location loader
-- `kernel/kernel.s`: console, FAT12 reader, COM loader and DOS interrupts
-- `programs/*.s`: sample DOS .COM and small MZ .EXE program source
-- `tools/mkfloppy.py`: FAT12 image constructor
-- `tools/mkmz.py`: small test-only MZ executable wrapper
-- `tests/test_image.py`: disk layout and executable integrity checks
-- `docs/ROADMAP.md`: next compatibility milestones
+## Files
 
-## Licensing
+- `boot/`: 8086 boot sector
+- `kernel/kernel.s`: DOS kernel and FAT12 driver
+- `programs/`: native DOS compatibility tests
+- `tools/mkfloppy.py`: reproducible FAT12 floppy image generator
+- `tests/test_image.py`: offline disk structural tests
+- `docs/ROADMAP.md`: next milestones
 
-GNU General Public License **version 3 only** (`COPYING`). Each original source
-file is GPL-3.0-only. No Microsoft or FreeDOS code has been copied into this
-prototype. BIOS/DOS public API behavior is used solely for compatibility.
+## License
+
+Original VelvetDOS source code is GNU General Public License version 3 only
+(`COPYING`, `SPDX-License-Identifier: GPL-3.0-only`). No Microsoft or FreeDOS
+code is included; interoperability follows the published DOS/BIOS interfaces.
