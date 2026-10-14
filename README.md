@@ -1,30 +1,40 @@
-# VelvetDOS 0.1.0 (experimental foundation)
+# VelvetDOS 0.2.0 (development preview)
 
 VelvetDOS is a new GNU GPLv3-licensed project aiming for **binary compatibility
 with DOS software** on IBM PC-compatible x86 computers. This milestone is a
 proof-of-concept real-mode floppy OS, **not yet a full MS-DOS replacement**.
 
-## What works in this first foundation
+## What works in this development preview
 
-- Bootable 1.44 MB FAT12 floppy image using a real BIOS 16-bit bootstrap.
-- A real-mode kernel with interrupt vector installation for `INT 20h/21h`.
-- Internal commands: `HELP`, `DIR`, `VER`, `CLS`, `REBOOT`.
-- Read-only FAT12 root-directory enumeration and FAT12 cluster chaining.
-- Load and execute **root-directory `.COM` programs** (up to 65024 bytes).
-- Initializes a minimal DOS Program Segment Prefix (PSP) and sets up a COM stack.
-- Process exit via `INT 20h`, `INT 21h AH=4Ch`, `AH=00h`, and near `RET`.
-- Partial `INT 21h` console API: `AH=01h`, `02h`, `07h`, `08h`, `09h`, `0Ah`,
-  `19h`, `30h`, `40h` (stdout/stderr only), `4Dh`, plus termination.
-- Three example genuine 16-bit programs: `HELLO.COM`, `RETURN.COM`,
-  and multi-cluster `CHAIN.COM`.
-- Dependency-free FAT12 disk packer and structural tests.
+All VelvetDOS 0.1.0 bootloader, FAT12, shell and `.COM` support remains.
+The 0.2.0 preview adds:
+
+- **Small MZ `.EXE` loading** with header validation and relocation fixing,
+  limited to a single 64 KiB image loaded from the floppy root directory.
+  Bare shell names search `.COM` before `.EXE`.
+- **Read-only DOS file handles** through `INT 21h`: `AH=3Dh` (open),
+  `3Eh` (close), `3Fh` (read), and `42h` (seek). Four concurrent file handles
+  numbered 5 through 8; no folders or disk writes.
+- **A basic MCB conventional-memory chain** with `AH=48h` (allocate),
+  `49h` (free), and `4Ah` (resize). Programs own their initial memory block
+  and generally must shrink it before they can allocate additional blocks.
+- Additional test programs: `EXEDEMO.EXE` (relocation), `READ.COM`
+  (open/read/seek/close across FAT12 sectors), `MEMORY.COM` (MCBs), and a
+  multi-sector `README.TXT` fixture.
+
+The entire boot/kernel/application foundation remains 8086 real-mode
+assembly. **No Pascal or protected-mode dependency has been introduced.**
+
+**Verification boundary:** the floppy image builds with GNU binutils, and
+structural and packer tests run locally. We cannot claim 0.2.0 works in 86Box
+until the interactive programs are actually tested there.
 
 ## Requirements (Linux)
 
 - GNU Make, GNU binutils (`as`, `ld`), Python 3.
 - QEMU (`qemu-system-i386`) **to actually run** the image.
 
-The kernel is currently **entirely 16-bit x86 assembly** so this first
+The kernel is currently **entirely 16-bit x86 assembly** so this early
 milestone needs no particular 16-bit C compiler. Future kernels can incorporate
 16-bit C via a toolchain such as Open Watcom.
 
@@ -36,11 +46,11 @@ make test
 make run
 ```
 
-`make run` boots from the generated `build/velvetdos-0.1.0.img`.
+`make run` boots from the generated `build/velvetdos-0.2.0.img`.
 You can also use:
 
 ```sh
-qemu-system-i386 -drive file=build/velvetdos-0.1.0.img,if=floppy,format=raw -boot a -m 16
+qemu-system-i386 -drive file=build/velvetdos-0.2.0.img,if=floppy,format=raw -boot a -m 16
 ```
 
 At the `A:\>` prompt, try:
@@ -52,6 +62,9 @@ VER
 HELLO
 RETURN
 CHAIN
+EXEDEMO
+READ
+MEMORY
 CLS
 ```
 
@@ -60,32 +73,33 @@ experimental boot image to a physical drive containing anything important.
 
 ## Important limitations
 
-**This is an early bootable kernel, not a claim of compatibility with all DOS
-programs.** Most DOS programs will not run yet.
+**This is a pre-alpha, not a general DOS-compatible release.** Many DOS
+programs will not run. The new MZ loader only accepts simple real-mode
+executables that fit inside one 64 KiB image; large/multisegment MZ programs,
+DOS overlays and protected-mode extenders are not supported.
 
-- No `.EXE` MZ loading, subdirectories, command arguments, pipes, or batch files.
-- No writable filesystem, file handles for disk files, DOS memory allocation,
-  TSR lifecycle, environment blocks, DOS device drivers, EMS/XMS, or DPMI.
-- No implementation of many documented or undocumented DOS calls.
-- Disk reads use BIOS CHS for a 1.44 MB floppy. Drive selection is limited to A:.
-- No hardware probing, robust disk retries, real memory ownership management,
-  secure process isolation, or fault recovery.
-- DOS applications that directly use BIOS or supported emulated hardware may
-  work partially, but hardware compatibility is outside this milestone.
-- System clock, locale, error handling, and disk media-change handling are incomplete.
-- MS-DOS version 6.22 is advertised by `INT 21h AH=30h` **only as a target
-  interface**; do not interpret this as API completeness.
+- No subdirectories, file creation/writes, file sharing or device-file opens.
+- No command-line argument tails, batch files, pipes, environment blocks,
+  DOS path search, standard input redirection, or a standalone `COMMAND.COM`.
+- The MCB implementation is provisional; no TSRs, resident drivers, EMS, XMS,
+  UMBs, DPMI or full DOS process inheritance semantics.
+- Disk access is BIOS CHS, 1.44 MB FAT12 and drive A: only.
+- Many `INT 21h` calls, DOS internals, hardware protocols, and disk errors
+  are still unsupported or simplified. BIOS and VGA behavior vary by emulator.
+- `INT 21h AH=30h` advertises DOS 6.22 solely as a compatibility target, not
+  an assertion of actual DOS 6.22 compatibility.
+- The experimental boot format reserves 64 post-boot sectors for the kernel;
+  it does not match Microsoft's DOS system boot layout.
 
-This is an educational/prototyping kernel. The disk-image layout reserves 64
-sectors after the FAT12 boot sector for the kernel; this **does not** match how
-MS-DOS itself lays out its operating system files.
+Do not overwrite an existing disk with this experimental image.
 
 ## Repository layout
 
 - `boot/boot.s`: FAT12 BIOS bootloader, 64-sector fixed-location loader
 - `kernel/kernel.s`: console, FAT12 reader, COM loader and DOS interrupts
-- `programs/*.s`: sample DOS .COM program source
+- `programs/*.s`: sample DOS .COM and small MZ .EXE program source
 - `tools/mkfloppy.py`: FAT12 image constructor
+- `tools/mkmz.py`: small test-only MZ executable wrapper
 - `tests/test_image.py`: disk layout and executable integrity checks
 - `docs/ROADMAP.md`: next compatibility milestones
 

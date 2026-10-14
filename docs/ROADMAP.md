@@ -5,12 +5,15 @@
 Bootable 1.44 MB FAT12 disk, source-built kernel, command loop, read-only root
 file access, basic INT 21h and COM launching. Includes test programs.
 
-## 0.2.0 — useful DOS filesystem/runtime
+## 0.2.0 — early DOS runtime (in progress)
 
-Add DOS-compatible error codes and flags for all calls, MZ `.EXE` loading and
-relocations, PSP and environment semantics, DOS handles and current directory,
-FAT12/16 open/read/seek/close, working DTA and find-first/find-next,
-proper conventional memory MCB allocations, and test-cases from DOS references.
+Deliver initial read-only file handles (open/read/seek/close), a bounded small
+MZ `.EXE` loader, and provisional MCB allocate/free/resize. Improve these into
+fully DOS-compatible behaviors incrementally. Still **to do**: general MZ
+loaders, PSP/environment/exit semantics, DTA and find-first/find-next,
+FAT12/FAT16 directories and writable files, richer DOS error handling.
+
+Do not mark this milestone complete until the new demos pass in 86Box.
 
 ## 0.3.0 — everyday DOS shell
 

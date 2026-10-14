@@ -3,7 +3,7 @@ AS ?= as
 LD ?= ld
 PYTHON ?= python3
 BUILD := build
-IMAGE := $(BUILD)/velvetdos-0.1.0.img
+IMAGE := $(BUILD)/velvetdos-0.2.0.img
 
 .PHONY: all image run test clean help
 all: image
@@ -43,8 +43,32 @@ $(BUILD)/chain.padded: $(BUILD)/chain.o
 $(BUILD)/CHAIN.COM: $(BUILD)/chain.padded
 	dd if=$< of=$@ bs=1 skip=256 status=none
 
-$(IMAGE): $(BUILD)/boot.bin $(BUILD)/kernel.bin $(BUILD)/HELLO.COM $(BUILD)/RETURN.COM $(BUILD)/CHAIN.COM tools/mkfloppy.py
-	$(PYTHON) tools/mkfloppy.py --boot $(BUILD)/boot.bin --kernel $(BUILD)/kernel.bin --file $(BUILD)/HELLO.COM --file $(BUILD)/RETURN.COM --file $(BUILD)/CHAIN.COM --output $@
+$(BUILD)/memory.o: programs/memory.s | $(BUILD)
+	$(AS) --32 -o $@ $<
+$(BUILD)/memory.padded: $(BUILD)/memory.o
+	$(LD) -m elf_i386 --oformat binary -Ttext 0 -o $@ $<
+$(BUILD)/MEMORY.COM: $(BUILD)/memory.padded
+	dd if=$< of=$@ bs=1 skip=256 status=none
+
+$(BUILD)/exedemo.o: programs/exedemo.s | $(BUILD)
+	$(AS) --32 -o $@ $<
+$(BUILD)/exedemo.raw: $(BUILD)/exedemo.o
+	$(LD) -m elf_i386 --oformat binary -Ttext 0 -o $@ $<
+$(BUILD)/EXEDEMO.EXE: $(BUILD)/exedemo.raw tools/mkmz.py
+	$(PYTHON) tools/mkmz.py $< $@
+
+$(BUILD)/read.o: programs/read.s | $(BUILD)
+	$(AS) --32 -o $@ $<
+$(BUILD)/read.padded: $(BUILD)/read.o
+	$(LD) -m elf_i386 --oformat binary -Ttext 0 -o $@ $<
+$(BUILD)/READ.COM: $(BUILD)/read.padded
+	dd if=$< of=$@ bs=1 skip=256 status=none
+
+$(BUILD)/README.TXT: | $(BUILD)
+	$(PYTHON) -c "from pathlib import Path; Path('$@').write_bytes(b'VELVETDOS 0.2.0 FILE API TEST\r\n' + b'FAT12 READ TEST DATA!\r\n' * 40)"
+
+$(IMAGE): $(BUILD)/boot.bin $(BUILD)/kernel.bin $(BUILD)/HELLO.COM $(BUILD)/RETURN.COM $(BUILD)/CHAIN.COM $(BUILD)/EXEDEMO.EXE $(BUILD)/READ.COM $(BUILD)/MEMORY.COM $(BUILD)/README.TXT tools/mkfloppy.py
+	$(PYTHON) tools/mkfloppy.py --boot $(BUILD)/boot.bin --kernel $(BUILD)/kernel.bin --file $(BUILD)/HELLO.COM --file $(BUILD)/RETURN.COM --file $(BUILD)/CHAIN.COM --file $(BUILD)/EXEDEMO.EXE --file $(BUILD)/READ.COM --file $(BUILD)/MEMORY.COM --file $(BUILD)/README.TXT --output $@
 
 run: image
 	qemu-system-i386 -drive file=$(IMAGE),format=raw,if=floppy -boot a -m 16 -no-reboot

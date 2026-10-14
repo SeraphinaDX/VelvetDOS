@@ -1,7 +1,7 @@
-/* VelvetDOS 0.1.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.2.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
- * Read-only FAT12 root directory; one COM application at a time.
+ * Read-only FAT12 root directory; one DOS application at a time.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -11,6 +11,9 @@
 .global _start
 .equ ROOT_SEG,       0x2000
 .equ FAT_SEG,        0x2200
+.equ IO_SEG,         0x2400
+.equ MEM_LIMIT,      0x9000
+.equ MEM_MCB,        0x2fff
 .equ APP_SEG,        0x3000
 .equ ROOT_SECTOR,    83
 .equ FAT_SECTOR,     65
@@ -71,7 +74,20 @@ shell_loop:
     jc do_reboot
     call prepare_filename
     jc bad_command
-    /* 0.1.0 is a COM loader, not an arbitrary binary/.EXE launcher. */
+    /* Recognize explicit .EXE as well as .COM; default remains .COM. */
+    cmp byte ptr [filename + 8], 'E'
+    jne .L_shell_check_com
+    cmp byte ptr [filename + 9], 'X'
+    jne bad_command
+    cmp byte ptr [filename + 10], 'E'
+    jne bad_command
+    call find_file
+    jc bad_command
+    call load_com
+    jc .L_shell_loop_load_error
+    call start_exe      /* validates MZ header and applies relocations */
+    jmp .L_shell_loop_load_error
+.L_shell_check_com:
     cmp byte ptr [filename + 8], 'C'
     jne bad_command
     cmp byte ptr [filename + 9], 'O'
@@ -79,7 +95,27 @@ shell_loop:
     cmp byte ptr [filename + 10], 'M'
     jne bad_command
     call find_file
+    jnc .L_shell_load_com
+    /* DOS searches .COM then .EXE when the command has no suffix. */
+    mov si, offset cmdline
+.L_shell_find_period:
+    lodsb
+    test al, al
+    jz .L_shell_try_exe
+    cmp al, '.'
+    je bad_command
+    jmp .L_shell_find_period
+.L_shell_try_exe:
+    mov byte ptr [filename + 8], 'E'
+    mov byte ptr [filename + 9], 'X'
+    mov byte ptr [filename + 10], 'E'
+    call find_file
     jc bad_command
+    call load_com
+    jc .L_shell_loop_load_error
+    call start_exe
+    jmp .L_shell_loop_load_error
+.L_shell_load_com:
     call load_com
     jc .L_shell_loop_load_error
     call start_com     /* does not return; app returns through INT 20h/21h */
@@ -259,7 +295,7 @@ str_eq:
     ret
 
 /* Convert FILENAME[.L_str_eq_EXT] into FAT 8.3 uppercase name.
- * No paths, spaces, switches or command-line arguments in 0.1.0. */
+ * No paths, spaces, switches or command-line arguments in 0.2.0. */
 prepare_filename:
     push ax
     push bx
@@ -463,19 +499,427 @@ fat_next:
     pop bx
     ret
 
-/* Create PSP and execute a real DOS .COM image. Never returns. */
-start_com:
+/* MZ loader: bounded one-segment real-mode subset (file <= 65024 bytes).
+ * Image from disk is at APP_SEG:0100. Apply relocations IN PLACE while
+ * header/table are still available, then slide image over the header.
+ * MZ EXEs with larger images/multiple load segments are not supported yet.
+ * Returns CF on invalid header, otherwise transfers control and never returns.
+ */
+start_exe:
+    push ds
+    mov ax, APP_SEG
+    mov es, ax
+    cmp word ptr es:[0x100], 0x5a4d
+    jne .L_exe_bad
+    mov ax, word ptr es:[0x108] /* header paragraphs */
+    cmp ax, 2
+    jb .L_exe_bad
+    cmp ax, 0x0ff0
+    ja .L_exe_bad
+    mov word ptr cs:[exe_hdrparas], ax
+    mov cl, 4
+    shl ax, cl
+    cmp ax, word ptr cs:[file_size]
+    jae .L_exe_bad
+    mov word ptr cs:[exe_hdrbytes], ax
+    mov bx, word ptr es:[0x118] /* relocation table offset */
+    mov cx, word ptr es:[0x106] /* relocation count */
+    cmp cx, 512
+    ja .L_exe_bad
+    mov ax, cx
+    shl ax, 1
+    shl ax, 1
+    add ax, bx
+    jc .L_exe_bad
+    cmp ax, word ptr cs:[exe_hdrbytes]
+    ja .L_exe_bad
+    mov ax, word ptr es:[0x10e]
+    mov word ptr cs:[exe_ss], ax
+    mov ax, word ptr es:[0x110]
+    mov word ptr cs:[exe_sp], ax
+    mov ax, word ptr es:[0x114]
+    mov word ptr cs:[exe_ip], ax
+    mov ax, word ptr es:[0x116]
+    mov word ptr cs:[exe_cs], ax
+    mov word ptr cs:[exe_reloc_remaining], cx
+    /* pre-relocate words inside the on-disk image */
+.L_exe_reloc_loop:
+    test cx, cx
+    jz .L_exe_reloc_done
+    mov ax, word ptr es:[bx + 2 + 0x100]
+    cmp ax, 0x0fff       /* only offsets within 64KiB */
+    ja .L_exe_bad
+    mov dx, ax
+    mov cl, 4
+    shl ax, cl
+    add ax, word ptr es:[bx + 0x100]
+    jc .L_exe_bad
+    inc ax
+    cmp ax, word ptr cs:[file_size]
+    jae .L_exe_bad
+    /* ensure relocation word is inside image and not header */
+    dec ax
+    mov si, word ptr cs:[file_size]
+    sub si, word ptr cs:[exe_hdrbytes]
+    inc ax
+    cmp ax, si
+    jae .L_exe_bad
+    /* use a separate segment to access relocation target */
+    mov ax, APP_SEG + 0x10
+    add ax, word ptr cs:[exe_hdrparas]
+    add ax, dx
+    mov ds, ax
+    mov si, word ptr es:[bx + 0x100]
+    add word ptr [si], APP_SEG + 0x10
+    mov ax, APP_SEG
+    mov ds, ax
+    add bx, 4
+    dec word ptr cs:[exe_reloc_remaining]
+    /* CX used as shift count; preserve explicit reloc counter below. */
+    mov cx, word ptr cs:[exe_reloc_remaining]
+    jmp .L_exe_reloc_loop
+.L_exe_reloc_done:
+    /* Copy code+data downward into conventional MZ load segment. */
+    mov ax, APP_SEG + 0x10
+    mov es, ax
+    add ax, word ptr cs:[exe_hdrparas]
+    mov ds, ax
+    xor si, si
+    xor di, di
+    mov cx, word ptr cs:[file_size]
+    sub cx, word ptr cs:[exe_hdrbytes]
+    rep movsb
+    pop ds
+    mov ax, cs
+    mov es, ax
+    call reset_mcb
+    call make_psp
+    /* entry CS and SS are relative to EXE load segment */
+    mov ax, APP_SEG + 0x10
+    add word ptr [exe_cs], ax
+    add word ptr [exe_ss], ax
+    cli
+    mov ax, word ptr [exe_ss]
+    mov ss, ax
+    mov sp, word ptr [exe_sp]
+    sti
+    mov ax, APP_SEG
+    mov ds, ax
+    mov es, ax
+    xor ax, ax
+    push word ptr cs:[exe_cs]
+    push word ptr cs:[exe_ip]
+    retf
+.L_exe_bad:
+    pop ds
+    stc
+    ret
+
+/* Exactly one MCB covering the current process until AH=4Ah shrinks it.
+ * Implementing allocation/free is staged separately from the EXE loader.
+ */
+reset_mcb:
+    push ax
+    push cx
+    push di
+    push es
+    mov ax, cs
+    mov es, ax
+    mov di, offset handles
+    mov cx, 48
+    xor al, al
+    rep stosb
+    mov ax, MEM_MCB
+    mov es, ax
+    mov byte ptr es:[0], 'Z'
+    mov word ptr es:[1], APP_SEG
+    mov word ptr es:[3], MEM_LIMIT - APP_SEG
+    pop es
+    pop di
+    pop cx
+    pop ax
+    ret
+
+make_psp:
+    push ax
+    push cx
+    push di
+    push es
     mov ax, APP_SEG
     mov es, ax
     xor di, di
     xor ax, ax
     mov cx, 128
     rep stosw
-    mov byte ptr es:[0], 0xcd      /* INT 20h instruction */
+    mov byte ptr es:[0], 0xcd
     mov byte ptr es:[1], 0x20
-    mov word ptr es:[2], 0x4000    /* approximate last available paragraph */
-    mov byte ptr es:[0x80], 0      /* empty command tail */
+    mov word ptr es:[2], MEM_LIMIT
+    mov byte ptr es:[0x80], 0
     mov byte ptr es:[0x81], 13
+    pop es
+    pop di
+    pop cx
+    pop ax
+    ret
+
+/* Normalize one root-directory 8.3 path supplied as ASCIIZ in ES:SI.
+ * Uppercases ASCII and optionally accepts A: or A:\ prefix.
+ * No subdirectories (intentional, reported as file not found).
+ */
+filename_from_es_si:
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    mov di, offset filename
+    mov cx, 11
+    mov al, ' '
+    push es
+    push cs
+    pop es
+    rep stosb
+    pop es
+    xor bx, bx
+    cmp byte ptr es:[si + 1], ':'
+    jne .L_fn_base
+    mov al, byte ptr es:[si]
+    and al, 0xdf
+    cmp al, 'A'
+    jne .L_fn_err
+    add si, 2
+    cmp byte ptr es:[si], '\'
+    je .L_fn_skip_slash
+    cmp byte ptr es:[si], '/'
+    jne .L_fn_base
+.L_fn_skip_slash:
+    inc si
+.L_fn_base:
+    mov al, byte ptr es:[si]
+    inc si
+    cmp al, 0
+    je .L_fn_finish
+    cmp al, '.'
+    je .L_fn_ext
+    cmp al, ' '
+    jbe .L_fn_err
+    cmp al, '\'
+    je .L_fn_err
+    cmp al, '/'
+    je .L_fn_err
+    cmp bx, 8
+    jae .L_fn_err
+    cmp al, 'a'
+    jb .L_fn_store_base
+    cmp al, 'z'
+    ja .L_fn_store_base
+    sub al, 32
+.L_fn_store_base:
+    mov byte ptr [filename + bx], al
+    inc bx
+    jmp .L_fn_base
+.L_fn_ext:
+    xor bx, bx
+.L_fn_ext_loop:
+    mov al, byte ptr es:[si]
+    inc si
+    test al, al
+    jz .L_fn_finish
+    cmp al, ' '
+    jbe .L_fn_err
+    cmp al, '.'
+    je .L_fn_err
+    cmp al, '\'
+    je .L_fn_err
+    cmp al, '/'
+    je .L_fn_err
+    cmp bx, 3
+    jae .L_fn_err
+    cmp al, 'a'
+    jb .L_fn_store_ext
+    cmp al, 'z'
+    ja .L_fn_store_ext
+    sub al, 32
+.L_fn_store_ext:
+    mov byte ptr [filename + bx + 8], al
+    inc bx
+    jmp .L_fn_ext_loop
+.L_fn_finish:
+    cmp byte ptr [filename], ' '
+    je .L_fn_err
+    clc
+    jmp .L_fn_leave
+.L_fn_err:
+    stc
+.L_fn_leave:
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+/* BX=handle id (5..8), return BX=handle table address or CF=1. */
+locate_handle:
+    cmp bx, 5
+    jb .L_lh_err
+    cmp bx, 8
+    ja .L_lh_err
+    sub bx, 5
+    push ax
+    mov ax, 12
+    mul bx
+    mov bx, ax
+    add bx, offset handles
+    pop ax
+    cmp byte ptr [bx], 1
+    jne .L_lh_err
+    clc
+    ret
+.L_lh_err:
+    stc
+    ret
+
+/* Read a byte from current handle position via cached 512-byte sector.
+ * BX = handle entry, AL returned, CF=1 on corrupt FAT/BIOS failure.
+ * Position update is owned by caller.
+ */
+read_file_byte:
+    push bx
+    push cx
+    push dx
+    push si
+    push es
+    mov ax, word ptr [bx + 6]
+    mov cl, 7
+    shl ax, cl
+    mov dx, word ptr [bx + 4]
+    mov cl, 9
+    shr dx, cl
+    or ax, dx            /* absolute sector ordinal within file */
+    cmp ax, word ptr [rw_cached_sector]
+    je .L_rfb_ready
+    mov word ptr [rw_cached_sector], ax
+    mov si, ax
+    mov dx, word ptr [bx + 2]
+.L_rfb_chain:
+    cmp dx, 2
+    jb .L_rfb_err
+    cmp dx, 2784
+    ja .L_rfb_err
+    test si, si
+    jz .L_rfb_sector
+    mov ax, dx
+    call fat_next
+    mov dx, ax
+    cmp dx, 0xff8
+    jae .L_rfb_err
+    dec si
+    jmp .L_rfb_chain
+.L_rfb_sector:
+    mov ax, IO_SEG
+    mov es, ax
+    xor bx, bx
+    mov ax, dx
+    add ax, DATA_BIAS
+    call read_sector
+    jc .L_rfb_err
+.L_rfb_ready:
+    mov ax, IO_SEG
+    mov es, ax
+    mov bx, word ptr [rw_handle]
+    mov si, word ptr [bx + 4]
+    and si, 511
+    mov al, byte ptr es:[si]
+    clc
+    jmp .L_rfb_exit
+.L_rfb_err:
+    mov word ptr [rw_cached_sector], 0xffff
+    stc
+.L_rfb_exit:
+    pop es
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+/* Locate a valid allocated MCB by its data segment (BX).
+ * Returns ES=MCB segment, CF clear; rejects interior/fictitious addresses.
+ */
+locate_mcb:
+    push ax
+    push dx
+    mov dx, MEM_MCB
+.L_locate_mcb_next:
+    mov es, dx
+    mov ax, dx
+    inc ax
+    cmp ax, bx
+    je .L_locate_mcb_found
+    cmp byte ptr es:[0], 'M'
+    jne .L_locate_mcb_bad
+    mov ax, word ptr es:[3]
+    inc ax
+    add dx, ax
+    cmp dx, MEM_LIMIT
+    jb .L_locate_mcb_next
+.L_locate_mcb_bad:
+    stc
+    jmp .L_locate_mcb_out
+.L_locate_mcb_found:
+    clc
+.L_locate_mcb_out:
+    pop dx
+    pop ax
+    ret
+
+/* Coalesce adjacent free MCBs; preserves all general-purpose registers.
+ * Every MCB chain must terminate with type 'Z'. */
+merge_free_mcbs:
+    push ax
+    push bx
+    push dx
+    push si
+    push es
+    mov dx, MEM_MCB
+.L_merge_loop:
+    mov es, dx
+    cmp byte ptr es:[0], 'M'
+    jne .L_merge_done
+    mov bx, word ptr es:[3]
+    inc bx
+    add bx, dx
+    cmp bx, MEM_LIMIT
+    jae .L_merge_done
+    cmp word ptr es:[1], 0
+    jne .L_merge_next
+    mov ax, bx
+    mov es, ax
+    cmp word ptr es:[1], 0
+    jne .L_merge_next
+    mov si, word ptr es:[3]
+    inc si
+    mov al, byte ptr es:[0]
+    mov es, dx
+    add word ptr es:[3], si
+    mov byte ptr es:[0], al
+    jmp .L_merge_loop
+.L_merge_next:
+    mov dx, bx
+    jmp .L_merge_loop
+.L_merge_done:
+    pop es
+    pop si
+    pop dx
+    pop bx
+    pop ax
+    ret
+
+/* Create PSP and execute a real DOS .COM image. Never returns. */
+start_com:
+    call reset_mcb
+    call make_psp
     cli
     mov ax, APP_SEG
     mov ds, ax
@@ -537,6 +981,20 @@ int21_handler:
     je .L_int21_handler_default_drive
     cmp ah, 0x30
     je .L_int21_handler_version
+    cmp ah, 0x3d
+    je .L_dos_open
+    cmp ah, 0x3e
+    je .L_dos_close
+    cmp ah, 0x3f
+    je .L_dos_read
+    cmp ah, 0x42
+    je .L_dos_seek
+    cmp ah, 0x48
+    je .L_dos_alloc
+    cmp ah, 0x49
+    je .L_dos_free
+    cmp ah, 0x4a
+    je .L_dos_resize
     cmp ah, 0x40
     je .L_int21_handler_write_handle
     cmp ah, 0x4d
@@ -627,6 +1085,327 @@ int21_handler:
     mov ax, 0x1606  /* MS-DOS 6.22 version encoding; compatibility target */
     xor bx, bx
     jmp .L_int21_handler_return
+/* DOS file handle operations. Read-only FAT12 root directory for now.
+ * Maximum four file handles (5..8). Standard console handles are separate.
+ * AH=3Dh DS:DX ASCIIZ  -> AX handle; AL must be 0 (read-only)
+ * AH=3Eh BX           -> close
+ * AH=3Fh BX/CX/DS:DX -> AX bytes read, zero at EOF
+ * AH=42h AL/BX/CX:DX  -> DX:AX new byte offset.
+ * Errors: 2=file not found, 4=too many handles, 5=access denied,
+ * 6=invalid handle, 1=invalid seek, 30=read failure.
+ */
+.L_dos_open:
+    test al, 3
+    jnz .L_open_denied
+    mov ax, word ptr ss:[bp + 14]  /* caller DS */
+    mov es, ax
+    mov si, word ptr ss:[bp + 6]   /* caller DX */
+    call filename_from_es_si
+    jc .L_open_not_found
+    call find_file
+    jc .L_open_not_found
+    mov si, offset handles
+    mov dx, 5
+.L_open_slot:
+    cmp byte ptr [si], 0
+    je .L_open_found
+    add si, 12
+    inc dx
+    cmp dx, 9
+    jb .L_open_slot
+    mov ax, 4
+    jmp .L_set_error
+.L_open_found:
+    mov byte ptr [si], 1
+    mov ax, word ptr [file_cluster]
+    mov word ptr [si + 2], ax
+    mov word ptr [si + 4], 0
+    mov word ptr [si + 6], 0
+    mov ax, word ptr [file_size]
+    mov word ptr [si + 8], ax
+    mov ax, word ptr [file_size_high]
+    mov word ptr [si + 10], ax
+    mov ax, dx
+    jmp .L_int21_handler_return
+.L_open_denied:
+    mov ax, 5
+    jmp .L_set_error
+.L_open_not_found:
+    mov ax, 2
+    jmp .L_set_error
+.L_dos_close:
+    mov bx, word ptr ss:[bp + 10]
+    call locate_handle
+    jc .L_invalid_handle
+    mov byte ptr [bx], 0
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_read:
+    mov bx, word ptr ss:[bp + 10]
+    call locate_handle
+    jc .L_invalid_handle
+    mov word ptr [rw_handle], bx
+    mov ax, word ptr ss:[bp + 14]
+    mov word ptr [rw_dstseg], ax
+    mov ax, word ptr ss:[bp + 6]
+    mov word ptr [rw_dstoff], ax
+    mov ax, word ptr ss:[bp + 8]
+    mov word ptr [rw_remaining], ax
+    mov word ptr [rw_read], 0
+    mov word ptr [rw_cached_sector], 0xffff
+.L_read_next:
+    cmp word ptr [rw_remaining], 0
+    je .L_read_done
+    mov bx, word ptr [rw_handle]
+    /* EOF if position >= length, unsigned 32-bit compare. */
+    mov ax, word ptr [bx + 6]
+    cmp ax, word ptr [bx + 10]
+    ja .L_read_done
+    jb .L_read_get_byte
+    mov ax, word ptr [bx + 4]
+    cmp ax, word ptr [bx + 8]
+    jae .L_read_done
+.L_read_get_byte:
+    call read_file_byte
+    jc .L_read_disk_error
+    push es
+    mov dx, word ptr [rw_dstseg]
+    mov es, dx
+    mov di, word ptr [rw_dstoff]
+    mov byte ptr es:[di], al
+    pop es
+    inc word ptr [rw_dstoff]
+    inc word ptr [rw_read]
+    dec word ptr [rw_remaining]
+    add word ptr [bx + 4], 1
+    adc word ptr [bx + 6], 0
+    jmp .L_read_next
+.L_read_done:
+    mov ax, word ptr [rw_read]
+    jmp .L_int21_handler_return
+.L_read_disk_error:
+    mov ax, 30
+    jmp .L_set_error
+.L_dos_seek:
+    mov byte ptr [rw_mode], al
+    mov bx, word ptr ss:[bp + 10]
+    call locate_handle
+    jc .L_invalid_handle
+    cmp byte ptr [rw_mode], 2
+    ja .L_seek_bad
+    mov ax, word ptr ss:[bp + 6] /* DX = offset low */
+    mov dx, word ptr ss:[bp + 8] /* CX = offset high */
+    cmp byte ptr [rw_mode], 0
+    je .L_seek_set
+    cmp byte ptr [rw_mode], 1
+    jne .L_seek_from_end
+    add ax, word ptr [bx + 4]
+    adc dx, word ptr [bx + 6]
+    jc .L_seek_bad
+    jmp .L_seek_set
+.L_seek_from_end:
+    add ax, word ptr [bx + 8]
+    adc dx, word ptr [bx + 10]
+    jc .L_seek_bad
+.L_seek_set:
+    test dx, 0x8000    /* disallow negative signed positions */
+    jnz .L_seek_bad
+    mov word ptr [bx + 4], ax
+    mov word ptr [bx + 6], dx
+    mov word ptr ss:[bp + 6], dx /* returned DX high word */
+    jmp .L_int21_handler_return
+.L_seek_bad:
+    mov ax, 1
+    jmp .L_set_error
+.L_invalid_handle:
+    mov ax, 6
+.L_set_error:
+    or word ptr ss:[bp + 20], 1
+    jmp .L_int21_handler_return
+
+/* Conventional memory MCB API. This prototype owns one MCB chain
+ * in low memory and resets it between shell applications. No TSRs yet.
+ * AH=48h: allocate BX paragraphs, AX=segment, failure BX=largest block.
+ * AH=49h: release block at ES, AX=9 for invalid block.
+ * AH=4Ah: resize ES to BX paragraphs, failure BX=maximum possible.
+ */
+.L_dos_alloc:
+    mov ax, word ptr ss:[bp + 10]
+    mov word ptr [mcb_req], ax
+    mov word ptr [mcb_largest], 0
+    test ax, ax
+    jz .L_mem_no_space
+    mov dx, MEM_MCB
+.L_mem_alloc_scan:
+    mov es, dx
+    mov al, byte ptr es:[0]
+    cmp al, 'M'
+    je .L_mem_alloc_type_ok
+    cmp al, 'Z'
+    jne .L_mem_no_space
+.L_mem_alloc_type_ok:
+    cmp word ptr es:[1], 0
+    jne .L_mem_alloc_next
+    mov ax, word ptr es:[3]
+    cmp ax, word ptr [mcb_largest]
+    jbe .L_mem_alloc_test
+    mov word ptr [mcb_largest], ax
+.L_mem_alloc_test:
+    cmp ax, word ptr [mcb_req]
+    jae .L_mem_alloc_fit
+.L_mem_alloc_next:
+    cmp byte ptr es:[0], 'Z'
+    je .L_mem_no_space
+    mov ax, word ptr es:[3]
+    inc ax
+    add dx, ax
+    cmp dx, MEM_LIMIT
+    jb .L_mem_alloc_scan
+    jmp .L_mem_no_space
+.L_mem_alloc_fit:
+    /* Split if >1 paragraph remains; one is needed for the new MCB. */
+    mov ax, word ptr es:[3]
+    sub ax, word ptr [mcb_req]
+    cmp ax, 1
+    jbe .L_mem_alloc_whole
+    dec ax
+    mov word ptr [mcb_temp_size], ax
+    mov al, byte ptr es:[0]
+    mov byte ptr [mcb_temp_type], al
+    mov ax, dx
+    inc ax
+    add ax, word ptr [mcb_req]
+    push es
+    mov es, ax
+    mov al, byte ptr [mcb_temp_type]
+    mov byte ptr es:[0], al
+    mov word ptr es:[1], 0
+    mov ax, word ptr [mcb_temp_size]
+    mov word ptr es:[3], ax
+    pop es
+    mov byte ptr es:[0], 'M'
+    mov ax, word ptr [mcb_req]
+    mov word ptr es:[3], ax
+.L_mem_alloc_whole:
+    mov word ptr es:[1], APP_SEG
+    mov ax, dx
+    inc ax
+    jmp .L_int21_handler_return
+.L_mem_no_space:
+    mov ax, word ptr [mcb_largest]
+    mov word ptr ss:[bp + 10], ax
+    mov ax, 8
+    jmp .L_set_error
+.L_dos_free:
+    mov bx, word ptr ss:[bp + 12] /* caller ES */
+    cmp bx, APP_SEG
+    je .L_mem_invalid
+    call locate_mcb
+    jc .L_mem_invalid
+    cmp word ptr es:[1], APP_SEG
+    jne .L_mem_invalid
+    mov word ptr es:[1], 0
+    call merge_free_mcbs
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_dos_resize:
+    mov bx, word ptr ss:[bp + 12] /* caller ES */
+    call locate_mcb
+    jc .L_mem_invalid
+    cmp word ptr es:[1], APP_SEG
+    jne .L_mem_invalid
+    mov ax, word ptr ss:[bp + 10]
+    mov word ptr [mcb_req], ax
+    mov ax, word ptr es:[3]
+    mov word ptr [mcb_largest], ax
+    cmp ax, word ptr [mcb_req]
+    je .L_mem_resize_ok
+    ja .L_mem_resize_shrink
+    /* Growing requires an immediately adjacent free MCB. */
+    cmp byte ptr es:[0], 'M'
+    jne .L_mem_resize_fail
+    mov ax, word ptr es:[3]
+    add ax, bx
+    mov dx, ax           /* BX is DATA segment; next MCB is BX + size */
+    push es
+    mov es, dx
+    cmp word ptr es:[1], 0
+    jne .L_mem_grow_no
+    mov ax, word ptr es:[3]
+    inc ax
+    add ax, word ptr [mcb_largest]
+    mov word ptr [mcb_largest], ax
+    mov al, byte ptr es:[0]
+    mov byte ptr [mcb_temp_type], al
+    pop es
+    mov ax, word ptr [mcb_largest]
+    cmp ax, word ptr [mcb_req]
+    jb .L_mem_resize_fail
+    sub ax, word ptr [mcb_req]
+    cmp ax, 1
+    jbe .L_mem_grow_all
+    /* New trailing free segment with remaining paragraphs. */
+    dec ax
+    mov word ptr [mcb_temp_size], ax
+    mov ax, bx
+    add ax, word ptr [mcb_req]
+    push es
+    mov es, ax
+    mov al, byte ptr [mcb_temp_type]
+    mov byte ptr es:[0], al
+    mov word ptr es:[1], 0
+    mov ax, word ptr [mcb_temp_size]
+    mov word ptr es:[3], ax
+    pop es
+    mov byte ptr es:[0], 'M'
+    mov ax, word ptr [mcb_req]
+    mov word ptr es:[3], ax
+    jmp .L_mem_resize_ok
+.L_mem_grow_all:
+    mov al, byte ptr [mcb_temp_type]
+    mov byte ptr es:[0], al
+    mov ax, word ptr [mcb_largest]
+    mov word ptr es:[3], ax
+    jmp .L_mem_resize_ok
+.L_mem_grow_no:
+    pop es
+    jmp .L_mem_resize_fail
+.L_mem_resize_shrink:
+    /* Leave one paragraph for the new MCB if possible. */
+    mov ax, word ptr es:[3]
+    sub ax, word ptr [mcb_req]
+    cmp ax, 1
+    jbe .L_mem_resize_ok
+    dec ax
+    mov word ptr [mcb_temp_size], ax
+    mov al, byte ptr es:[0]
+    mov byte ptr [mcb_temp_type], al
+    mov ax, bx
+    add ax, word ptr [mcb_req]
+    push es
+    mov es, ax
+    mov al, byte ptr [mcb_temp_type]
+    mov byte ptr es:[0], al
+    mov word ptr es:[1], 0
+    mov ax, word ptr [mcb_temp_size]
+    mov word ptr es:[3], ax
+    pop es
+    mov byte ptr es:[0], 'M'
+    mov ax, word ptr [mcb_req]
+    mov word ptr es:[3], ax
+    call merge_free_mcbs
+.L_mem_resize_ok:
+    xor ax, ax
+    jmp .L_int21_handler_return
+.L_mem_resize_fail:
+    mov ax, word ptr [mcb_largest]
+    mov word ptr ss:[bp + 10], ax
+    mov ax, 8
+    jmp .L_set_error
+.L_mem_invalid:
+    mov ax, 9
+    jmp .L_set_error
+
 .L_int21_handler_return_code:
     xor ax, ax
     jmp .L_int21_handler_return
@@ -741,23 +1520,44 @@ read_sector:
     ret
 
 /* Runtime state and messages. */
+mcb_req:           .word 0
+mcb_largest:       .word 0
+mcb_temp_size:     .word 0
+mcb_temp_type:     .byte 0
+.align 2
+rw_handle:         .word 0
+rw_dstseg:         .word 0
+rw_dstoff:         .word 0
+rw_remaining:      .word 0
+rw_read:           .word 0
+rw_cached_sector:  .word 0xffff
+rw_mode:           .byte 0
+.align 2
+handles:           .space 48  /* 4 x 12-byte read-only handle records */
+exe_hdrparas:      .word 0
+exe_hdrbytes:       .word 0
+exe_reloc_remaining:.word 0
+exe_cs:            .word 0
+exe_ip:            .word 0
+exe_ss:            .word 0
+exe_sp:            .word 0
 boot_drive:         .byte 0
 file_cluster:       .word 0
 file_size:          .word 0
 file_size_high:     .word 0
 filename:           .space 11
 cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.1.0  [experimental]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.2.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\>"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
 cmd_ver:            .asciz "VER"
 cmd_cls:            .asciz "CLS"
 cmd_reboot:         .asciz "REBOOT"
-help_text:          .asciz "Commands: HELP, DIR, VER, CLS, REBOOT\r\nRun a root-directory .COM program by name (e.g. HELLO).\r\nOnly root-directory, read-only files and a subset of INT 21h work.\r\n"
+help_text:          .asciz "Commands: HELP, DIR, VER, CLS, REBOOT\r\nRun root .COM or small MZ .EXE programs by name.\r\nOnly read-only FAT12 and a subset of INT 21h work.\r\n"
 dir_header:         .asciz "Root directory:\r\n"
 bad_command_message:.asciz "Bad command or file name.\r\n"
-load_error_message: .asciz "Unable to load COM file (size, FAT chain or disk error).\r\n"
+load_error_message: .asciz "Unable to load DOS program (format, size or disk error).\r\n"
 disk_error_message: .asciz "FATAL: Cannot read floppy disk.\r\n"
 .align 2
 stack_start: .space 2048

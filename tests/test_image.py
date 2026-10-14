@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.1.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.2.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,15 +37,17 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.1.0", kernel)
+        self.assertIn(b"VelvetDOS 0.2.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
         self.assertEqual(self.fat, self.img[74*512:83*512])
 
     def test_program_contents_match_cluster_chains(self):
-        files = {name: (BIN / name).read_bytes() for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM")}
-        for i, (name, original) in enumerate(files.items()):
+        names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
+                 "READ.COM", "MEMORY.COM", "README.TXT")
+        for i, name in enumerate(names):
+            original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
             self.assertEqual(item[:11], mkfloppy.dos_name(name))
             self.assertEqual(struct.unpack_from("<I", item, 28)[0], len(original))
@@ -60,7 +62,30 @@ class FloppyTest(unittest.TestCase):
                 cluster = fat_next(self.fat, cluster)
             self.assertEqual(cluster, 0xfff)
             self.assertEqual(recovered[:len(original)], original)
-            self.assertTrue(original.startswith(b"\xba"), "expected native 16-bit MOV DX,imm16")
+
+    def test_dos_com_examples_have_valid_binary_headers(self):
+        for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM"):
+            self.assertTrue((BIN / name).read_bytes().startswith(b"\xba"), name)
+        # MEMORY starts with PUSH DS (1Eh), then POP ES (07h).
+        self.assertTrue((BIN / "MEMORY.COM").read_bytes().startswith(b"\x1e\x07"))
+
+    def test_mz_relocation_fixture(self):
+        mz = (BIN / "EXEDEMO.EXE").read_bytes()
+        self.assertEqual(mz[:2], b"MZ")
+        last, pages, count, header_paras = struct.unpack_from("<4H", mz, 2)
+        self.assertEqual((pages - 1) * 512 + (last or 512), len(mz))
+        self.assertEqual(count, 1)
+        self.assertEqual(header_paras, 2)
+        reloc_offset = struct.unpack_from("<H", mz, 0x18)[0]
+        self.assertEqual(mz[reloc_offset:reloc_offset+4], b"\x00\x00\x00\x00")
+        self.assertEqual(mz[32:34], b"\x00\x00")
+        self.assertIn(b"MZ EXE relocation", mz)
+
+    def test_dos_read_test_crosses_multiple_clusters(self):
+        data = (BIN / "README.TXT").read_bytes()
+        self.assertGreater(len(data), 600)
+        self.assertTrue(data.startswith(b"VELVETDOS"))
+        self.assertGreater(len((BIN / "READ.COM").read_bytes()), 0)
 
     def test_multicluster_com(self):
         size = (BIN / "CHAIN.COM").stat().st_size
