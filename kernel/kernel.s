@@ -1,7 +1,7 @@
-/* VelvetDOS 0.5.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.6.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
- * FAT12 root and single-cluster subdirectories (8.3 only); one DOS application at a time.
+ * FAT12 root and bounded multi-cluster subdirectories (8.3); one DOS application at a time.
  * Not a replacement for full MS-DOS and not ready for real hardware.
  */
 .intel_syntax noprefix
@@ -19,6 +19,7 @@
 .equ ROOT_SECTOR,    83
 .equ FAT_SECTOR,     65
 .equ ROOT_ENTRIES,   224
+.equ MAX_DIR_CLUSTERS, 8 /* DIR_SEG holds eight 512-byte clusters */
 .equ ROOT_SECTORS,   14
 .equ FAT_SECTORS,    9
 .equ DATA_BIAS,     95    /* first data LBA (97) minus first cluster (2) */
@@ -861,12 +862,20 @@ filename_from_es_si:
     pop ax
     ret
 
-/* Return ES view and CX number of 32-byte entries for selected directory.
- * A non-root directory occupies exactly one FAT12 cluster in this version.
- * CF=1 when BIOS cannot read it. Preserves AX/BX/DX/SI/DI. */
+/* Load the entire selected directory into a contiguous buffer.
+ * ES:0000 = first 32-byte entry, CX = count of available entries.
+ * Root stays in ROOT_SEG; subdirectories span up to eight FAT12 clusters
+ * loaded consecutively into DIR_SEG (4 KiB). Larger chains are rejected,
+ * not silently truncated. Preserve AX/BX/DX/SI/DI; return CF on error.
+ * A whole-directory buffer keeps DOS entry offsets stable for open handles.
+ */
 select_directory:
     push ax
     push bx
+    push dx
+    push si
+    mov word ptr [dir_cluster_count], 0
+    mov word ptr [dir_last_cluster], 0
     mov ax, word ptr [dir_parent_cluster]
     test ax, ax
     jnz .L_sd_subdir
@@ -876,47 +885,92 @@ select_directory:
     clc
     jmp .L_sd_exit
 .L_sd_subdir:
-    cmp ax, 2
-    jb .L_sd_error
-    cmp ax, 2784
-    ja .L_sd_error
-    add ax, DATA_BIAS
-    push ax
+    mov dx, ax
     mov ax, DIR_SEG
     mov es, ax
-    pop ax
     xor bx, bx
+.L_sd_load:
+    cmp dx, 2
+    jb .L_sd_error
+    cmp dx, 2784
+    ja .L_sd_error
+    mov word ptr [dir_last_cluster], dx
+    mov ax, dx
+    add ax, DATA_BIAS
     call read_sector
-    mov cx, 16
+    jc .L_sd_error
+    add bx, 512
+    inc word ptr [dir_cluster_count]
+    mov ax, dx
+    call fat_next
+    cmp ax, 0x0ff8
+    jae .L_sd_loaded
+    cmp word ptr [dir_cluster_count], MAX_DIR_CLUSTERS
+    jae .L_sd_error
+    mov dx, ax
+    jmp .L_sd_load
+.L_sd_loaded:
+    mov cx, word ptr [dir_cluster_count]
+    shl cx, 1
+    shl cx, 1
+    shl cx, 1
+    shl cx, 1                 /* 16 directory entries per sector */
+    clc
     jmp .L_sd_exit
 .L_sd_error:
     stc
 .L_sd_exit:
+    pop si
+    pop dx
     pop bx
     pop ax
     ret
 
-/* Commit the selected directory if it is not the in-memory FAT root. */
+/* Commit all sectors in the selected directory (not merely cluster #1).
+ * ES:BX points at DIR_SEG, which must contain the selected directory data.
+ * Preserve all general registers except flags; limit traversal to 8 links. */
 flush_directory:
     push ax
     push bx
+    push cx
+    push dx
     push es
-    mov ax, word ptr [dir_parent_cluster]
-    test ax, ax
-    jz .L_fd_root
-    add ax, DATA_BIAS
-    push ax
+    mov dx, word ptr [dir_parent_cluster]
+    test dx, dx
+    jnz .L_fd_subdir
+    mov byte ptr [fs_dirty], 1
+    clc
+    jmp .L_fd_done
+.L_fd_subdir:
     mov ax, DIR_SEG
     mov es, ax
-    pop ax
     xor bx, bx
+    mov cx, MAX_DIR_CLUSTERS
+.L_fd_loop:
+    cmp dx, 2
+    jb .L_fd_error
+    cmp dx, 2784
+    ja .L_fd_error
+    mov ax, dx
+    add ax, DATA_BIAS
     call write_sector
+    jc .L_fd_error
+    add bx, 512
+    mov ax, dx
+    call fat_next
+    cmp ax, 0x0ff8
+    jae .L_fd_ok
+    mov dx, ax
+    loop .L_fd_loop
+.L_fd_error:
+    stc
     jmp .L_fd_done
-.L_fd_root:
-    mov byte ptr [fs_dirty], 1
+.L_fd_ok:
     clc
 .L_fd_done:
     pop es
+    pop dx
+    pop cx
     pop bx
     pop ax
     ret
@@ -1602,7 +1656,7 @@ int21_handler:
 
 /* FAT12 8.3 file APIs (four handles: 5..8).
  * 3Ch create/truncate, 3Dh open R/W, 3Eh close, 3Fh read, 40h write,
- * 41h delete, 42h seek. No directory paths or sharing yet.
+ * 41h delete, 42h seek. Directory paths supported, but no file sharing or locking yet.
  * Handle layout: used(0), mode(1), cluster(2), pos(4,6), size(8,10),
  * root offset(12), padding(14); length 16 bytes.
  */
@@ -2309,7 +2363,7 @@ dta_findnext:
     ret
 
 /* Directory operations share the path resolver and 8.3 FAT12 entries.
- * A directory owns exactly one cluster (16 entries including . and ..).
+ * Subdirectories can grow to eight clusters (128 entries including dots).
  * AX returns a DOS error on CF=1, otherwise CF=0.
  */
 dos_mkdir:
@@ -2409,11 +2463,8 @@ dos_rmdir:
     jc .L_rmdir_bad
     mov ax, word ptr [file_cluster]
     mov word ptr [new_dir_cluster], ax
-    /* Do not claim a multi-cluster directory is empty when only its
-     * first cluster was inspected. We don't traverse these until later. */
-    call fat_next
-    cmp ax, 0x0ff8
-    jb .L_rmdir_access
+    /* The emptiness scan below checks ALL clusters, and free_file_chain
+     * releases the entire chain once it has no live directory entries. */
     mov ax, word ptr [new_dir_cluster]
     /* Never remove the cwd or any ancestor of it. */
     mov cl, byte ptr [cwd_depth]
@@ -2660,10 +2711,18 @@ fill_handle:
     mov word ptr [si + 14], ax
     ret
 
-/* Locate a free 32-byte slot in selected directory. */
+/* Find an unused 32-byte slot, growing a full subdirectory by one
+ * FAT12 cluster (up to MAX_DIR_CLUSTERS) when necessary. Root is fixed.
+ * Always zero and write the new directory sector BEFORE publishing the FAT
+ * chain link. On failure, this pre-alpha filesystem can leak a cluster;
+ * it does not offer atomic metadata transactions.
+ * file_dir_offset is a BYTE offset in the contiguous directory buffer.
+ */
 find_free_root:
     push ax
+    push bx
     push cx
+    push dx
     push di
     push es
     call select_directory
@@ -2676,16 +2735,46 @@ find_free_root:
     je .L_ffr_found
     add di, 32
     loop .L_ffr_loop
-.L_ffr_failed:
-    stc
-    jmp .L_ffr_exit
+    cmp word ptr [dir_parent_cluster], 0
+    je .L_ffr_failed  /* FAT12 root cannot grow */
+    mov ax, word ptr [dir_cluster_count]
+    cmp ax, MAX_DIR_CLUSTERS
+    jae .L_ffr_failed
+    mov bx, ax
+    mov cl, 9
+    shl bx, cl          /* offset of new 512-byte sector in DIR_SEG */
+    mov word ptr [new_dir_offset], bx
+    call allocate_cluster
+    jc .L_ffr_failed
+    mov word ptr [new_dir_cluster], ax
+    /* Clear the new directory sector; it begins with an end marker. */
+    mov di, bx
+    xor ax, ax
+    mov cx, 256
+    rep stosw
+    mov ax, word ptr [new_dir_cluster]
+    add ax, DATA_BIAS
+    call write_sector
+    jc .L_ffr_failed
+    /* Link only after the empty sector was written. */
+    mov ax, word ptr [dir_last_cluster]
+    mov dx, word ptr [new_dir_cluster]
+    call fat_set
+    call flush_metadata
+    jc .L_ffr_failed
+    mov di, word ptr [new_dir_offset]
 .L_ffr_found:
     mov word ptr [file_dir_offset], di
     clc
+    jmp .L_ffr_exit
+.L_ffr_failed:
+    stc
 .L_ffr_exit:
     pop es
     pop di
+    pop dx
     pop cx
+    pop bx
     pop ax
     ret
 
@@ -3253,6 +3342,9 @@ file_size_high:     .word 0
 filename:           .space 11
 .align 2
 dir_parent_cluster: .word 0
+dir_cluster_count: .word 0
+dir_last_cluster:  .word 0
+new_dir_offset:    .word 0
 cwd_cluster:        .word 0
 cwd_depth:          .byte 0
 path_depth:         .byte 0
@@ -3265,14 +3357,14 @@ new_dir_cluster:    .word 0
 saved_parent_cluster:.word 0
 
 cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.5.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.6.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
 cmd_ver:            .asciz "VER"
 cmd_cls:            .asciz "CLS"
 cmd_reboot:         .asciz "REBOOT"
-help_text:          .asciz "Commands: HELP, DIR, CD, MD, RD, VER, CLS, REBOOT\r\nRun local .COM or small MZ .EXE programs by name.\r\nFAT12 single-cluster directories, 8.3 paths and DOS file API.\r\n"
+help_text:          .asciz "Commands: HELP, DIR, CD, MD, RD, VER, CLS, REBOOT\r\nRun local .COM or small MZ .EXE programs by name.\r\nFAT12 multi-cluster directories (up to 128 entries), 8.3 paths and DOS file API.\r\n"
 dir_header:         .asciz "Directory:\r\n"
 dir_marker:         .asciz "  <DIR>"
 dir_error_message:  .asciz "Directory operation failed.\r\n"

@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.5.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.6.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.5.0", kernel)
+        self.assertIn(b"VelvetDOS 0.6.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -180,9 +180,48 @@ class FloppyTest(unittest.TestCase):
             self.root[i*32:i*32+11]
             for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
         ]
-        for prog in ("FINDTEST.COM", "VLIST.COM"):
+        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM"):
             self.assertIn(mkfloppy.dos_name(prog), names)
             self.assertGreater((BIN / prog).stat().st_size, 100)
+
+    def test_directory_growth_kernel_has_bounded_buffer_and_full_chain_flush(self):
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        self.assertIn(".equ MAX_DIR_CLUSTERS, 8", source)
+        self.assertIn("dir_cluster_count:", source)
+        self.assertIn("dir_last_cluster:", source)
+        self.assertIn("new_dir_offset:", source)
+        start = source.index("select_directory:")
+        end = source.index("flush_directory:", start)
+        self.assertIn("call fat_next", source[start:end])
+        self.assertIn("call read_sector", source[start:end])
+        self.assertIn("cmp word ptr [dir_cluster_count], MAX_DIR_CLUSTERS", source[start:end])
+        start = end
+        end = source.index("find_file:", start)
+        self.assertIn("call fat_next", source[start:end])
+        self.assertIn("call write_sector", source[start:end])
+        start = source.index("find_free_root:")
+        end = source.index("root_is_open:", start)
+        self.assertIn("call allocate_cluster", source[start:end])
+        self.assertIn("call fat_set", source[start:end])
+        self.assertIn("call flush_metadata", source[start:end])
+        self.assertIn("call write_sector", source[start:end])
+
+    def test_dirgrow_external_dos_api_fixture(self):
+        blob = (BIN / "DIRGROW.COM").read_bytes()
+        self.assertIn(b"DIRGROW.COM:", blob)
+        self.assertIn(b"A:\\GROW\\*.TST", blob)
+        self.assertIn(b"A:\\GROW\\F", blob)
+        for code in (0x39, 0x3c, 0x40, 0x3e, 0x4e, 0x4f, 0x3f, 0x41, 0x3a):
+            self.assertIn(bytes([0xb4, code]), blob)
+        self.assertTrue(100 < len(blob) < 65024)
+        self.assertNotEqual(blob[:2], b"MZ")
+        self.assertEqual(self.root[14*32:14*32+11], mkfloppy.dos_name("DIRGROW.COM"))
+
+    def test_directory_buffer_cannot_overlap_application_memory(self):
+        # The 8086 directory cache is at 2600:0000; 8*512 bytes fit
+        # below the kernel's 3000:0000 application reservation.
+        self.assertLess(0x2600 * 16 + 8 * 512, 0x3000 * 16)
+        self.assertEqual((BIN / "kernel.bin").stat().st_size <= 32768, True)
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):
