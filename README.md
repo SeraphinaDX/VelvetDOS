@@ -1,110 +1,107 @@
-# VelvetDOS 0.6.0 (development preview)
+# VelvetDOS 0.7.0 — Program compatibility preview
 
-VelvetDOS is an experimental **GNU GPLv3-only**, 8086-compatible, real-mode
-DOS operating system. **This preview has not been boot-tested in 86Box yet**;
-run it only with disposable, writable floppy image copies.
+VelvetDOS is an experimental **8086 real-mode DOS-compatible operating system**
+under GNU **GPLv3-only**. This release builds on the 0.6.0 source that was
+validated in 86Box by the project owner. It adds a real DOS-style PSP command
+tail and a minimal process environment so native DOS programs can inspect
+arguments and startup information.
 
-## What's new
+> **Development preview:** Builds and offline tests pass, but **0.7.0 has not
+> yet been boot-tested in 86Box**. Use disposable disk images, not real data.
 
-Version 0.6.0 extends **FAT12 subdirectories from 1 cluster (16 directory
-entries) to up to 8 clusters (128 entries, including `.` and `..`)**. The FAT
-root directory remains fixed at 224 entries, as required by the image's BPB.
+## Added in 0.7.0
 
-- Subdirectory reads now follow the FAT12 cluster chain, loading the complete
-  directory into a bounded 4 KiB buffer.
-- Creating a file or subdirectory in a full subdirectory allocates another
-  cluster, zero-initializes and writes it, and links it into the FAT chain.
-- File lookup, DOS Find First/Find Next, directory listing, timestamps, attributes,
-  and open-handle directory entry offsets work with entries beyond the first
-  cluster.
-- Metadata flushing writes *every* directory cluster, and `RD` checks and
-  frees the entire directory chain when empty.
-- A new DOS API-only `DIRGROW.COM` test creates **20 files**, forces a second
-  directory cluster, searches them through the DOS DTA, reads the final file,
-  deletes all files, and removes the directory.
-- The earlier 0.1.0–0.5.0 regression programs are retained.
+- The internal shell accepts arguments after a `.COM` or small MZ `.EXE` name.
+  The executable name is normalized to uppercase for FAT12 lookup, while the
+  tail's original case and whitespace are preserved.
+- A DOS-compatible command tail is passed in the PSP at offset `80h`: one
+  length byte, the tail starting at `81h`, then a carriage return (`0Dh`).
+  `INT 21h AH=2Fh` still reports the default DTA at `PSP:0080h`.
+- The PSP now has pointers to the startup interrupt vectors, a placeholder
+  parent segment (`0`), a conventional default handle table, and two blank
+  default FCB name fields. DOS handle inheritance is not yet implemented.
+- `PSP:002Ch` points to a read-only bootstrap environment below the program
+  allocation area. It contains `PATH=A:\`, `PROMPT=$P$G` and an extended
+  program-name string. `SET` / per-process mutable environments remain future work.
+- `INT 21h AH=51h` and `62h` return the current PSP segment in `BX`.
+- `INT 21h AH=4Ch` records the application's `AL` exit code; `INT 20h` and
+  `AH=00h` record zero. `AH=4Dh` has a minimal one-shot return-code query,
+  but no parent process or nested EXEC handling yet.
+- `STATUS`, a temporary VelvetDOS shell diagnostic, displays the last exit
+  status in hexadecimal.
+- New public-API DOS test programs: `PSPTEST.COM` and `EXITTEST.COM`.
 
-## Linux build
+No Free Pascal, DPMI, or protected-mode code has been added.
 
-Requires GNU Make, GNU binutils (`as`, `ld`), Python 3, and optional QEMU.
-No 16-bit C compiler or Free Pascal compiler is required.
+## Build from source on Linux
+
+Requires GNU Make, GNU binutils (`as`, `ld`, `objdump` for one regression), and
+Python 3. QEMU is optional.
 
 ```sh
 make clean test
-make run   # only if qemu-system-i386 is installed
+make run                  # if QEMU is installed
 ```
 
-Output: `build/velvetdos-0.6.0.img` — a 1.44 MB FAT12 floppy image.
+The 1.44 MB image is `build/velvetdos-0.7.0.img`. Copy this image before
+using it as a writable floppy in **86Box**.
 
-## Manual 86Box acceptance test
+## 86Box acceptance testing
 
-**Boot a new, writable copy of the image. Do not use an image that already
-contains `A:\\GROW`.**
+Boot **a fresh writable image** and enter these commands exactly (the mixed
+case matters for verifying the command tail):
 
 ```text
-A:\\>VER
-A:\\>HELLO
-A:\\>EXEDEMO
-A:\\>FINDTEST
-A:\\>DIRGROW
+A:\>VER
+A:\>PSPTEST hello MiXeD 123
+A:\>STATUS
+A:\>EXITTEST
+A:\>STATUS
+A:\>HELLO
+A:\>EXEDEMO
+A:\>FINDTEST
+A:\>VLIST
 ```
 
-The new regression should print:
+Expected messages:
 
 ```text
-DIRGROW.COM: 20 files, FAT directory growth, DTA, cleanup PASS!
+PSPTEST.COM: command tail, PSP, DTA, handles, environment PASS!
+Last program exit code (hex): 00
+EXITTEST.COM: returning code 2A hex (42 decimal).
+Last program exit code (hex): 2A
 ```
 
-If it fails, report the exact `DIRGROW.COM failed at: ... AX=XXXX` output.
-A failed test may leave the `GROW` directory on disk, so use a **fresh copy**
-before retrying. `DIRGROW` automatically removes all its test files and
-`GROW` on success.
+`PSPTEST` will print `PSPTEST.COM failed at: <stage>` if an API check fails.
+When `STATUS` is invoked after that failure, the expected hexadecimal code is
+`01`. Test `DIRGROW`, `PATHS` and `WRITE/APPEND/RECHECK/DELETE` on separate
+fresh writable images because they manipulate on-disk files and directories.
 
-Separately verify `VLIST`, `READ`, and `PATHS` on fresh writable disk copies.
-`PATHS` creates `LAB`/`ONE`; it should not be run twice on the same image.
+## Important limitations
 
-## DOS interface status
+- This is **not a full MS-DOS-compatible environment**: no standalone
+  `COMMAND.COM`, batch processing, `AH=4Bh` EXEC, process nesting, environment
+  mutation, conventional handle inheritance, shell variable expansion,
+  pipelines, redirection or quoting rules. PSP vectors are copied but no
+  full termination/break handler mechanism is implemented.
+- The shell accepts a single 8.3 command token and a raw argument tail. It
+  does not understand quoted executable paths or search `PATH` for programs.
+  The command-line input limit is **120 characters** total.
+- `AH=4Dh` reflects the last terminated program, not a real parent's child
+  process status. The `STATUS` shell command is non-standard and diagnostic.
+- Subdirectories are limited to 8 FAT12 clusters; FAT12 writes are not
+  crash-safe. Only 1.44 MB floppy geometry and limited `.COM`/MZ loading.
+- Kernel and C library DOS API coverage remains incomplete; hardware-specific
+  games and 32-bit DOS extenders are unsupported.
 
-The OS still implements a **small subset** of MS-DOS calls, including `.COM`
-and restricted MZ `.EXE` loading, FAT12 file create/read/write/delete/seek,
-DOS pathname parsing, `CD`/`MD`/`RD`, attributes and timestamps, DTA management,
-Find First/Find Next and basic memory management.
+## Project layout and license
 
-### Known limitations
+- `boot/` — 8086 bootloader
+- `kernel/` — real-mode kernel, DOS INT 21h handler and FAT12 driver
+- `programs/` — standalone DOS API regression programs
+- `tools/` — host-side FAT12 image generator and minimal MZ fixture creator
+- `tests/` — offline integrity and static compatibility regression checks
+- `docs/ROADMAP.md` — milestone roadmap
 
-- **Pre-alpha:** only static FAT12 1.44 MB floppy geometry, no FAT16/32,
-  filenames limited to 8.3, no LFN, no hard-disk controller support.
-- Maximum eight FAT12 clusters (128 directory entries) in a subdirectory;
-  attempting to add a 129th entry fails without growing past the buffer.
-- The root directory does not grow. Directory blocks are *not* reclaimed
-  while a directory is still present; `RD` releases the whole chain.
-- Metadata writes are not atomic or journaled. Abrupt reset, power loss,
-  emulated media failure, or write errors can leave a damaged FAT12 image.
-- Long/looping/corrupt FAT chains are not fully hardened against malicious
-  disk images; keep testing on disposable images.
-- DOS file locking/sharing, robust error propagation, full 8086 MZ loading,
-  resident device drivers, process environments, batch files, PC game
-  hardware quirks, and most `INT 21h` services remain unimplemented.
-- The shell is still built into the kernel, not a separate `COMMAND.COM`.
-- 386 protected mode, DPMI/GO32v2 and Free Pascal applications are deferred.
-
-**Verification completed here:** kernel and floppy image build, 21 Python
-structural tests pass, the previous DOS program binaries are preserved, and
-checks confirm the directory buffer does not overlap application memory.
-The 0.6.0 runtime path has **not** yet been exercised in an x86 emulator.
-
-## Source layout
-
-- `boot/` — 8086 boot sector
-- `kernel/kernel.s` — DOS interrupt handler and FAT12 filesystem
-- `programs/dirgrow.s` — new native directory expansion test
-- `programs/` — other native regression programs
-- `tests/test_image.py` — FAT12 and build integrity tests
-- `tools/` — boot image generator and DOS MZ test helper
-- `docs/ROADMAP.md` — release goals
-
-## License
-
-VelvetDOS source files are licensed under the **GNU General Public License
-version 3 only** (see `COPYING`, SPDX `GPL-3.0-only`). No Microsoft or
-FreeDOS proprietary/copy-left incompatible kernel code is included.
+All original VelvetDOS source code is **GNU GPL version 3 only** (`COPYING`,
+SPDX `GPL-3.0-only`). No Microsoft or FreeDOS kernel code was copied.

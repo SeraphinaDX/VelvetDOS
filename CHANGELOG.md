@@ -1,32 +1,22 @@
 # VelvetDOS changelog
 
-## 0.6.0 (development preview; awaiting 86Box acceptance)
+## 0.7.0 — Program compatibility preview (2026-10-14)
 
-- Make FAT12 subdirectories grow from one to eight clusters, up to 128 entries
-  per directory including `.` and `..`. FAT12 root remains fixed at 224 slots.
-- Load the entire bounded directory FAT chain into a 4 KiB cache; reject chains
-  exceeding eight clusters rather than silently ignoring later entries.
-- Allocate, zero, and persist additional directory sectors on demand, linking
-  them through the normal FAT12 allocator.
-- Flush all sectors of a modified subdirectory and preserve logical directory
-  entry offsets in DOS file handles and directory searches.
-- Scan all directory clusters before `RD`; free a multi-cluster directory's
-  FAT chain only when all its directory entries are empty/deleted.
-- Include `DIRGROW.COM`: DOS API-only test for 20 file creations, enumerating
-  more than 16 directory slots, reopening the 20th file, deletion, and cleanup.
-- Retain 0.5.0 DTA/Find First/Find Next and all earlier runtime tests.
-- Add three structural integrity regressions; 21 offline tests pass.
-- **Warning:** no crash-consistency/journaling; write operations must use only
-  disposable floppy images. 86Box test of this version still outstanding.
+- Accept command-line arguments for built-in shell execution of DOS `.COM`
+  and restricted `.EXE` programs; uppercase only the executable token.
+- Fill the 128-byte PSP command-tail area with length, verbatim arguments and
+  DOS carriage-return terminator.
+- Populate PSP environment segment pointer, standard handle placeholders,
+  blank FCB name slots, and copied INT 22h/23h/24h vectors.
+- Provide a fixed read-only DOS environment at segment 2A00h, outside the
+  application memory allocation range.
+- Add `INT 21h AH=51h/62h` current-PSP queries and preliminary return code
+  tracking via AH=4Ch/4Dh; add `STATUS` shell debug command.
+- Add `PSPTEST.COM` and `EXITTEST.COM` regression fixtures. Preserve earlier
+  boot, FAT12, executable, directory and find-first test programs.
+- Expand offline tests to 23. Tests are **not** proof of 86Box runtime
+  behavior; complete the documented acceptance test before tagging.
 
-## 0.5.0 (86Box validated by project owner)
+## Earlier releases
 
-- DOS DTA pointer management (`INT 21h AH=1Ah/2Fh`), Find First/Next
-  (`AH=4Eh/4Fh`), 8.3 wildcards, file attributes (`AH=43h`), FAT timestamps
-  (`AH=57h`), and free-space reporting (`AH=36h`).
-- Native DOS `FINDTEST.COM` and `VLIST.COM` utilities.
-
-## Earlier versions
-
-See Git history for 0.4.0 path support and directory creation, 0.3.0 file
-writes, 0.2.0 DOS handles/MZ loading, and 0.1.0 bootable floppy foundation.
+See the repository's tagged changelogs for 0.1.0–0.6.0 history.

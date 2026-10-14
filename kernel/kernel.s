@@ -1,4 +1,4 @@
-/* VelvetDOS 0.6.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.7.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and bounded multi-cluster subdirectories (8.3); one DOS application at a time.
@@ -16,6 +16,7 @@
 .equ MEM_LIMIT,      0x9000
 .equ MEM_MCB,        0x2fff
 .equ APP_SEG,        0x3000
+.equ ENV_SEG,        0x2a00  /* read-only bootstrap environment below MEM_MCB */
 .equ ROOT_SECTOR,    83
 .equ FAT_SECTOR,     65
 .equ ROOT_ENTRIES,   224
@@ -43,6 +44,7 @@ _start:
     mov word ptr [dta_seg], 0
     mov word ptr [dta_off], offset kernel_dta
     call load_tables
+    call init_environment
     mov si, offset banner
     call print_z
 shell_loop:
@@ -60,6 +62,7 @@ shell_loop:
     mov al, '>'
     call putc
     call read_line
+    call uppercase_command_token
     cmp byte ptr [cmdline], 0
     je shell_loop
     mov si, offset cmdline
@@ -78,6 +81,10 @@ shell_loop:
     mov di, offset cmd_cls
     call str_eq
     jc do_cls
+    mov si, offset cmdline
+    mov di, offset cmd_status
+    call str_eq
+    jc do_status
     mov si, offset cmdline
     mov di, offset cmd_reboot
     call str_eq
@@ -119,6 +126,8 @@ shell_loop:
     jc shell_dir_error
     jmp shell_loop
 .L_shell_no_directory_cmd:
+    /* Strip the executable token, keep the exact case and spacing of its tail. */
+    call split_external_command
     mov ax, word ptr [cwd_cluster]
     mov word ptr [dir_parent_cluster], ax
     call prepare_filename
@@ -201,6 +210,14 @@ do_cls:
     jmp shell_loop
 do_reboot:
     int 0x19
+    jmp shell_loop
+
+do_status:
+    mov si, offset status_message
+    call print_z
+    mov al, byte ptr [last_exit_code]
+    call print_hex_byte
+    call newline
     jmp shell_loop
 
 do_dir:
@@ -287,6 +304,32 @@ newline:
     pop ax
     ret
 
+/* Print a byte in hexadecimal without relying on DOS itself. */
+print_hex_byte:
+    push ax
+    push bx
+    mov bl, al
+    mov cl, 4
+    shr al, cl
+    call print_hex_nibble
+    mov al, bl
+    and al, 0x0f
+    call print_hex_nibble
+    pop bx
+    pop ax
+    ret
+print_hex_nibble:
+    and al, 0x0f
+    cmp al, 10
+    jb .L_hex_digit
+    add al, 'A' - 10
+    jmp .L_hex_print
+.L_hex_digit:
+    add al, '0'
+.L_hex_print:
+    call putc
+    ret
+
 /* Read a line and uppercase ASCII; DEL/backspace editing, CR to submit. */
 read_line:
     push ax
@@ -307,14 +350,8 @@ read_line:
     jb .L_read_line_key
     cmp al, 126
     ja .L_read_line_key
-    cmp bx, 63
+    cmp bx, 120
     jae .L_read_line_key
-    cmp al, 'a'
-    jb .L_read_line_store
-    cmp al, 'z'
-    ja .L_read_line_store
-    sub al, 32
-.L_read_line_store:
     mov byte ptr [di], al
     inc di
     inc bx
@@ -337,6 +374,82 @@ read_line:
     call newline
     pop di
     pop bx
+    pop ax
+    ret
+
+/* Normalize only the command token: argument strings must retain their case.
+ * Keep original spacing after the first whitespace until PSP copy. */
+uppercase_command_token:
+    push ax
+    push si
+    mov si, offset cmdline
+.L_upper_next:
+    mov al, byte ptr [si]
+    test al, al
+    jz .L_upper_end
+    cmp al, ' '
+    je .L_upper_end
+    cmp al, 'a'
+    jb .L_upper_step
+    cmp al, 'z'
+    ja .L_upper_step
+    sub al, 32
+    mov byte ptr [si], al
+.L_upper_step:
+    inc si
+    jmp .L_upper_next
+.L_upper_end:
+    pop si
+    pop ax
+    ret
+
+/* Extract the original DOS command tail including its leading space.
+ * cmdline becomes the ASCIIZ program token used by 8.3 lookup. */
+split_external_command:
+    push ax
+    push cx
+    push si
+    push di
+    mov byte ptr [cmdtail_len], 0
+    mov si, offset cmdline
+.L_split_seek:
+    mov al, byte ptr [si]
+    test al, al
+    jz .L_split_done
+    cmp al, ' '
+    je .L_split_copy
+    inc si
+    jmp .L_split_seek
+.L_split_copy:
+    mov di, offset cmdtail
+    xor cx, cx
+.L_split_loop:
+    mov al, byte ptr [si]
+    test al, al
+    jz .L_split_end
+    cmp cx, 126
+    jae .L_split_end
+    mov byte ptr [di], al
+    inc di
+    inc si
+    inc cx
+    jmp .L_split_loop
+.L_split_end:
+    mov byte ptr [cmdtail_len], cl
+    mov byte ptr [di], 0
+    /* Terminate program token at the first space, not at the tail end. */
+    mov si, offset cmdline
+.L_split_rewind:
+    cmp byte ptr [si], ' '
+    je .L_split_nul
+    inc si
+    jmp .L_split_rewind
+.L_split_nul:
+    mov byte ptr [si], 0
+.L_split_done:
+    pop di
+    pop si
+    pop cx
     pop ax
     ret
 
@@ -653,9 +766,35 @@ reset_mcb:
     pop ax
     ret
 
-make_psp:
+/* A basic static DOS 3.x-style environment. All programs see the same
+ * read-only variables; AH=4B EXEC and SET remain future work. This memory
+ * lives below the DOS application MCB and must not be freed with AH=49. */
+init_environment:
     push ax
     push cx
+    push si
+    push di
+    push es
+    mov ax, ENV_SEG
+    mov es, ax
+    xor di, di
+    mov si, offset environment_template
+    mov cx, environment_end - environment_template
+    rep movsb
+    pop es
+    pop di
+    pop si
+    pop cx
+    pop ax
+    ret
+
+/* Establish the single-process PSP for .COM and small MZ .EXE programs.
+ * DTA defaults to PSP:80h. Reserved fields are zeroed; no shell PSP yet. */
+make_psp:
+    push ax
+    push bx
+    push cx
+    push si
     push di
     push es
     mov ax, APP_SEG
@@ -667,13 +806,68 @@ make_psp:
     mov byte ptr es:[0], 0xcd
     mov byte ptr es:[1], 0x20
     mov word ptr es:[2], MEM_LIMIT
-    mov byte ptr es:[0x80], 0
-    mov byte ptr es:[0x81], 13
+    /* Expose terminate, Ctrl-Break and critical-error IVT vectors. */
+    xor ax, ax
+    mov es, ax
+    mov ax, word ptr es:[0x22 * 4]
+    mov bx, word ptr es:[0x22 * 4 + 2]
+    mov cx, APP_SEG
+    mov es, cx
+    mov word ptr es:[0x0a], ax
+    mov word ptr es:[0x0c], bx
+    xor ax, ax
+    mov es, ax
+    mov ax, word ptr es:[0x23 * 4]
+    mov bx, word ptr es:[0x23 * 4 + 2]
+    mov cx, APP_SEG
+    mov es, cx
+    mov word ptr es:[0x0e], ax
+    mov word ptr es:[0x10], bx
+    xor ax, ax
+    mov es, ax
+    mov ax, word ptr es:[0x24 * 4]
+    mov bx, word ptr es:[0x24 * 4 + 2]
+    mov cx, APP_SEG
+    mov es, cx
+    mov word ptr es:[0x12], ax
+    mov word ptr es:[0x14], bx
+    /* No separate COMMAND.COM process exists yet, so parent is zero. */
+    mov word ptr es:[0x16], 0
+    mov word ptr es:[0x2c], ENV_SEG
+    /* Standard inherited handle table (0..4; 5..19 unused). */
+    mov di, 0x18
+    mov cx, 20
+    mov al, 0xff
+    rep stosb
+    mov byte ptr es:[0x18], 0
+    mov byte ptr es:[0x19], 1
+    mov byte ptr es:[0x1a], 2
+    mov byte ptr es:[0x1b], 3
+    mov byte ptr es:[0x1c], 4
+    /* Two 8.3 default FCB slots; no filename-to-FCB translation yet. */
+    mov di, 0x5d
+    mov al, ' '
+    mov cx, 11
+    rep stosb
+    mov di, 0x6d
+    mov cx, 11
+    rep stosb
+    /* PSP:80h has length, PSP:81h contains bytes, then CR. */
+    mov al, byte ptr [cmdtail_len]
+    mov byte ptr es:[0x80], al
+    xor ch, ch
+    mov cl, al
+    mov si, offset cmdtail
+    mov di, 0x81
+    rep movsb
+    mov byte ptr es:[di], 13
     mov word ptr [dta_seg], APP_SEG
     mov word ptr [dta_off], 0x80
     pop es
     pop di
+    pop si
     pop cx
+    pop bx
     pop ax
     ret
 
@@ -1218,6 +1412,7 @@ start_com:
 
 /* Software INT 20h process exit. App stack is discarded. */
 int20_handler:
+    mov byte ptr cs:[last_exit_code], 0
 process_exit:
     cli
     mov ax, cs
@@ -1235,7 +1430,10 @@ process_exit:
  */
 int21_handler:
     cmp ah, 0x4c
-    je process_exit
+    jne .L_int21_not_exit
+    mov byte ptr cs:[last_exit_code], al
+    jmp process_exit
+.L_int21_not_exit:
     push ds
     push es
     push bx
@@ -1308,6 +1506,10 @@ int21_handler:
     je .L_int21_handler_write_handle
     cmp ah, 0x4d
     je .L_int21_handler_return_code
+    cmp ah, 0x51
+    je .L_dos_get_psp
+    cmp ah, 0x62
+    je .L_dos_get_psp
     cmp ah, 0x00
     je .L_int21_handler_exit_now
     mov ax, 1
@@ -2162,6 +2364,12 @@ int21_handler:
 
 .L_int21_handler_return_code:
     xor ax, ax
+    mov al, byte ptr [last_exit_code]
+    mov byte ptr [last_exit_code], 0  /* consumed as in DOS parent process */
+    jmp .L_int21_handler_return
+.L_dos_get_psp:
+    mov word ptr ss:[bp + 10], APP_SEG  /* return PSP segment in BX */
+    xor ax, ax
     jmp .L_int21_handler_return
 .L_int21_handler_write_handle:
     mov bx, word ptr ss:[bp + 10]
@@ -2193,6 +2401,7 @@ int21_handler:
     or word ptr ss:[bp + 20], 1
     jmp .L_int21_handler_return
 .L_int21_handler_exit_now:
+    mov byte ptr [last_exit_code], 0
     jmp process_exit
 .L_int21_handler_return:
     pop bp
@@ -3356,15 +3565,29 @@ cwd_text:           .space 128
 new_dir_cluster:    .word 0
 saved_parent_cluster:.word 0
 
-cmdline:            .space 64
-banner:             .asciz "\r\nVelvetDOS 0.6.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+cmdline:            .space 128
+cmdtail:            .space 128
+cmdtail_len:        .byte 0
+last_exit_code:     .byte 0
+/* DOS environment strings are NUL-separated and double-NUL terminated.
+ * The trailing count=1 and ASCIIZ path are conventional DOS 3+ metadata. */
+environment_template:
+    .asciz "PATH=A:\\"
+    .asciz "PROMPT=$P$G"
+    .byte 0
+    .word 1
+    .asciz "A:\\VELVETDOS"
+environment_end:
+banner:             .asciz "\r\nVelvetDOS 0.7.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"
 cmd_ver:            .asciz "VER"
 cmd_cls:            .asciz "CLS"
+cmd_status:         .asciz "STATUS"
 cmd_reboot:         .asciz "REBOOT"
-help_text:          .asciz "Commands: HELP, DIR, CD, MD, RD, VER, CLS, REBOOT\r\nRun local .COM or small MZ .EXE programs by name.\r\nFAT12 multi-cluster directories (up to 128 entries), 8.3 paths and DOS file API.\r\n"
+help_text:          .asciz "Commands: HELP, DIR, CD, MD, RD, VER, CLS, STATUS, REBOOT\r\nRun .COM or small MZ .EXE programs with command-line arguments.\r\nPSP command tail, environment and limited DOS file API.\r\n"
+status_message:     .asciz "Last program exit code (hex): "
 dir_header:         .asciz "Directory:\r\n"
 dir_marker:         .asciz "  <DIR>"
 dir_error_message:  .asciz "Directory operation failed.\r\n"

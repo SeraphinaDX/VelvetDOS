@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.6.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.7.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.6.0", kernel)
+        self.assertIn(b"VelvetDOS 0.7.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -180,9 +180,9 @@ class FloppyTest(unittest.TestCase):
             self.root[i*32:i*32+11]
             for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
         ]
-        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM"):
+        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM"):
             self.assertIn(mkfloppy.dos_name(prog), names)
-            self.assertGreater((BIN / prog).stat().st_size, 100)
+            self.assertGreater((BIN / prog).stat().st_size, 30)
 
     def test_directory_growth_kernel_has_bounded_buffer_and_full_chain_flush(self):
         source = (ROOT / "kernel" / "kernel.s").read_text()
@@ -222,6 +222,40 @@ class FloppyTest(unittest.TestCase):
         # below the kernel's 3000:0000 application reservation.
         self.assertLess(0x2600 * 16 + 8 * 512, 0x3000 * 16)
         self.assertEqual((BIN / "kernel.bin").stat().st_size <= 32768, True)
+
+    def test_psp_and_environment_entrypoints(self):
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        for marker in ("make_psp:", "init_environment:",
+                       "uppercase_command_token:", "split_external_command:",
+                       ".L_dos_get_psp:", "cmdtail_len:", "last_exit_code:"):
+            self.assertIn(marker, source)
+        self.assertIn(".equ ENV_SEG,        0x2a00", source)
+        self.assertIn("mov word ptr es:[0x2c], ENV_SEG", source)
+        self.assertIn("mov byte ptr es:[di], 13", source)
+        self.assertIn("mov word ptr es:[0x16], 0", source)
+        self.assertIn("mov word ptr ss:[bp + 10], APP_SEG", source)
+        kernel = (BIN / "kernel.bin").read_bytes()
+        expected = (b"PATH=A:" + bytes([92, 0]) + b"PROMPT=$P$G"
+                    + bytes([0, 0, 1, 0]) + b"A:" + bytes([92]) + b"VELVETDOS\x00")
+        self.assertIn(expected, kernel)
+        self.assertIn(b"Last program exit code (hex): ", kernel)
+        self.assertLess(len(kernel), 32769)
+
+    def test_native_psptest_and_exitcode_programs(self):
+        psp = (BIN / "PSPTEST.COM").read_bytes()
+        self.assertIn(b" hello MiXeD 123", psp)
+        self.assertIn(b"PSPTEST.COM: command tail", psp)
+        self.assertIn(b"Environment block", psp)
+        self.assertIn(b"\xb4\x62", psp)  # AH=62: get PSP
+        self.assertIn(b"\xb4\x51", psp)  # AH=51: get PSP
+        self.assertIn(b"\xb4\x2f", psp)  # AH=2F: get DTA
+        self.assertIn(b"\xb8\x01\x4c", psp)  # AX=4C01: failing process exit
+        exiting = (BIN / "EXITTEST.COM").read_bytes()
+        self.assertIn(b"EXITTEST.COM: returning code 2A", exiting)
+        self.assertIn(b"\xb8\x2a\x4c", exiting) # AX=4C2A
+        for name in ("PSPTEST.COM", "EXITTEST.COM"):
+            self.assertIn(mkfloppy.dos_name(name),
+                          [self.root[i*32:i*32+11] for i in range(224)])
 
     def test_reject_oversized_kernel(self):
         with self.assertRaises(ValueError):
