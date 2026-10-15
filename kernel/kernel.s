@@ -1,4 +1,4 @@
-/* VelvetDOS 0.10.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.11.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and bounded multi-cluster directories (8.3); one resident shell
@@ -17,8 +17,9 @@
 .equ MEM_LIMIT,      0x9000
 .equ MEM_MCB,        0x2fff
 .equ APP_SEG,        0x3000
-.equ CHILD_SEG,      0x5000
+.equ CHILD_SEG,      0x5000  /* first available child segment */
 .equ CHILD_MCB,      0x4fff
+.equ CHILD_PARAS,    0x1100  /* 68 KiB incl. MZ load segment and near-64K SP */
 .equ ENV_SEG,        0x2a00  /* resident shell environment */
 .equ CHILD_ENV_SEG,  0x2b00  /* bounded 256-byte child environment staging */
 .equ ROOT_SECTOR,    83
@@ -767,8 +768,9 @@ start_exe:
     stc
     ret
 
-/* Exactly one MCB covering the current process until AH=4Ah shrinks it.
- * Implementing allocation/free is staged separately from the EXE loader.
+/* Initial resident COMMAND.COM owns the first block (3000h..4FFEh).
+ * The remaining conventional memory starts as an unowned free MCB.
+ * Never reinitialize this MCB chain during child EXEC/termination.
  */
 reset_mcb:
     push ax
@@ -788,9 +790,14 @@ reset_mcb:
     mov byte ptr [rw_cache_dirty], 0
     mov ax, MEM_MCB
     mov es, ax
-    mov byte ptr es:[0], 'Z'
+    mov byte ptr es:[0], 'M'
     mov word ptr es:[1], APP_SEG
-    mov word ptr es:[3], MEM_LIMIT - APP_SEG
+    mov word ptr es:[3], CHILD_MCB - APP_SEG
+    mov ax, CHILD_MCB
+    mov es, ax
+    mov byte ptr es:[0], 'Z'
+    mov word ptr es:[1], 0
+    mov word ptr es:[3], MEM_LIMIT - CHILD_SEG
     pop es
     pop di
     pop cx
@@ -836,7 +843,15 @@ make_psp:
     rep stosw
     mov byte ptr es:[0], 0xcd
     mov byte ptr es:[1], 0x20
-    mov word ptr es:[2], MEM_LIMIT
+    /* PSP:2 is the exclusive end of this program's OWN allocation. */
+    mov ax, word ptr [current_psp]
+    dec ax
+    mov es, ax
+    mov bx, word ptr es:[3]
+    mov ax, word ptr [current_psp]
+    add bx, ax
+    mov es, ax
+    mov word ptr es:[2], bx
     /* Expose terminate, Ctrl-Break and critical-error IVT vectors. */
     xor ax, ax
     mov es, ax
@@ -1439,6 +1454,115 @@ merge_free_mcbs:
     pop ax
     ret
 
+/* AH=4B reserves an actual free 68-KiB process MCB before loading.
+ * Returns AX=new PSP, CF clear; CF set for no suitable block. The
+ * original shell and any allocations made by the shell remain untouched.
+ * Split off a trailing free MCB when there is enough room for its header.
+ * Uses the same first-fit policy as AH=48h, with bounded traversal. */
+reserve_exec_block:
+    push bx
+    push cx
+    push dx
+    push es
+    mov dx, MEM_MCB
+.L_reserve_scan:
+    mov es, dx
+    mov al, byte ptr es:[0]
+    cmp al, 'M'
+    je .L_reserve_type_ok
+    cmp al, 'Z'
+    jne .L_reserve_fail
+.L_reserve_type_ok:
+    cmp word ptr es:[1], 0
+    jne .L_reserve_next
+    mov ax, word ptr es:[3]
+    cmp ax, CHILD_PARAS
+    jb .L_reserve_next
+    /* Original free header is at DX; allocation data begins at DX+1. */
+    mov cx, CHILD_PARAS
+    sub ax, cx
+    cmp ax, 1
+    jbe .L_reserve_whole
+    /* A new free MCB is located immediately after the child allocation. */
+    dec ax
+    mov bx, ax                /* remainder after the new header */
+    mov ax, dx
+    add ax, CHILD_PARAS + 1
+    /* ES is already saved on entry; another PUSH here corrupts RET. */
+    mov es, ax
+    mov word ptr es:[1], 0
+    mov word ptr es:[3], bx
+    mov ax, dx
+    mov es, ax
+    mov bl, byte ptr es:[0]
+    push es
+    mov ax, dx
+    add ax, CHILD_PARAS + 1
+    mov es, ax
+    mov byte ptr es:[0], bl
+    pop es
+    mov byte ptr es:[0], 'M'
+    mov word ptr es:[3], CHILD_PARAS
+.L_reserve_whole:
+    mov ax, dx
+    inc ax
+    mov word ptr es:[1], ax  /* DOS owner of process block = own PSP */
+    clc
+    jmp .L_reserve_done
+.L_reserve_next:
+    cmp byte ptr es:[0], 'Z'
+    je .L_reserve_fail
+    mov ax, word ptr es:[3]
+    inc ax
+    add dx, ax
+    cmp dx, MEM_LIMIT
+    jb .L_reserve_scan
+.L_reserve_fail:
+    stc
+.L_reserve_done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+/* Free all blocks owned by AX and coalesce the adjacent unowned blocks.
+ * Ownership, not a guessed block address, determines what is released.
+ * Called on normal child termination and on failed image preparation. */
+release_process_blocks:
+    push ax
+    push bx
+    push dx
+    push es
+    mov bx, ax
+    mov dx, MEM_MCB
+.L_release_scan:
+    mov es, dx
+    mov al, byte ptr es:[0]
+    cmp al, 'M'
+    je .L_release_valid
+    cmp al, 'Z'
+    jne .L_release_finish
+.L_release_valid:
+    cmp word ptr es:[1], bx
+    jne .L_release_next
+    mov word ptr es:[1], 0
+.L_release_next:
+    cmp byte ptr es:[0], 'Z'
+    je .L_release_finish
+    mov ax, word ptr es:[3]
+    inc ax
+    add dx, ax
+    cmp dx, MEM_LIMIT
+    jb .L_release_scan
+.L_release_finish:
+    call merge_free_mcbs
+    pop es
+    pop dx
+    pop bx
+    pop ax
+    ret
+
 /* Create PSP and execute a real DOS .COM image. Never returns. */
 start_com:
     call reset_mcb
@@ -1468,7 +1592,7 @@ inherit_child_handles:
     push es
     mov ax, APP_SEG
     mov ds, ax
-    mov ax, CHILD_SEG
+    mov ax, word ptr cs:[exec_load_segment]
     mov es, ax
     mov bx, 5
 .L_ich_next:
@@ -1556,17 +1680,10 @@ process_exit:
     call close_all_handles
     cmp byte ptr [exec_active], 0
     je .L_exit_to_recovery_shell
-    /* A child exited. Rebuild the resident shell's conventional-memory MCB,
-     * restore its DTA and INT 21h frame, and resume the suspended caller.
-     * Only one child is permitted in this 0.8.0 preview. */
-    mov ax, MEM_MCB
-    mov es, ax
-    mov byte ptr es:[0], 'Z'
-    mov word ptr es:[1], APP_SEG
-    mov word ptr es:[3], MEM_LIMIT - APP_SEG
-    mov ax, APP_SEG
-    mov es, ax
-    mov word ptr es:[2], MEM_LIMIT
+    /* Restore parent without altering any parent-owned memory blocks.
+     * Release only the exiting child's PSP and AH=48h allocations. */
+    mov ax, word ptr [current_psp]
+    call release_process_blocks
     mov word ptr [current_psp], APP_SEG
     mov word ptr [exec_load_segment], APP_SEG
     mov word ptr [psp_parent], 0
@@ -2344,12 +2461,12 @@ int21_handler:
     jmp .L_int21_handler_return
 
 /* Validate, relocate, and compact a bounded MZ child image.
- * Input: loaded DOS file at CHILD_SEG:0100h, size in file_size.
- * Output: code/data at CHILD_SEG+10h:0000, relocated EXE entry in
+ * Input: loaded DOS file at exec_load_segment:0100h.
+ * Output: code/data at exec_load_segment+10h:0000, relocated EXE entry in
  * exe_ip/exe_cs and stack in exe_sp/exe_ss. CF=1 on malformed input.
  * Does NOT alter the resident parent's PSP, stack, MCB, or DTA.
  * Restriction: entire file <=65024 bytes; one <=64K initialized image;
- * stack and declared minimum memory fit the existing child allocation.
+ * stack and declared minimum memory fit the 68-KiB child allocation.
  */
 prepare_child_exe:
     push ax
@@ -2360,7 +2477,7 @@ prepare_child_exe:
     push di
     push ds
     push es
-    mov ax, CHILD_SEG
+    mov ax, word ptr [exec_load_segment]
     mov es, ax
     cmp word ptr es:[0x100], 0x5a4d
     jne .L_child_mz_bad
@@ -2412,11 +2529,11 @@ prepare_child_exe:
     shr ax, cl
     add ax, word ptr es:[0x10a]
     jc .L_child_mz_bad
-    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    cmp ax, CHILD_PARAS - 0x10
     ja .L_child_mz_bad
     mov ax, word ptr es:[0x116] /* relative CS */
     mov word ptr [exe_cs], ax
-    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    cmp ax, CHILD_PARAS - 0x10
     jae .L_child_mz_bad
     mov dx, ax
     mov cl, 4
@@ -2429,7 +2546,7 @@ prepare_child_exe:
     mov ax, word ptr es:[0x114]
     mov word ptr [exe_ip], ax
     mov ax, word ptr es:[0x10e] /* relative SS */
-    cmp ax, MEM_LIMIT - CHILD_SEG - 0x10
+    cmp ax, CHILD_PARAS - 0x10
     jae .L_child_mz_bad
     mov word ptr [exe_ss], ax
     mov bx, word ptr es:[0x110] /* SP */
@@ -2438,7 +2555,7 @@ prepare_child_exe:
     shr bx, cl
     add bx, ax
     jc .L_child_mz_bad
-    cmp bx, MEM_LIMIT - CHILD_SEG - 0x10
+    cmp bx, CHILD_PARAS - 0x10
     jae .L_child_mz_bad
     /* Relocation table must be entirely within MZ header. */
     mov bx, word ptr es:[0x118] /* relocation offset */
@@ -2473,11 +2590,14 @@ prepare_child_exe:
     jc .L_child_mz_bad
     cmp ax, word ptr [exe_image_bytes]
     jae .L_child_mz_bad
-    mov ax, CHILD_SEG + 0x10
+    mov ax, word ptr [exec_load_segment]
+    add ax, 0x10
     add ax, word ptr [exe_hdrparas]
     add ax, dx
     mov ds, ax
-    add word ptr [si], CHILD_SEG + 0x10
+    mov ax, word ptr cs:[exec_load_segment]
+    add ax, 0x10
+    add word ptr [si], ax
     push cs
     pop ds
     add bx, 4
@@ -2485,7 +2605,8 @@ prepare_child_exe:
     jmp .L_child_mz_reloc
 .L_child_mz_copy:
     /* Source lies above destination, so a forward copy is overlap-safe. */
-    mov ax, CHILD_SEG + 0x10
+    mov ax, word ptr [exec_load_segment]
+    add ax, 0x10
     mov es, ax
     add ax, word ptr [exe_hdrparas]
     mov ds, ax
@@ -2493,7 +2614,8 @@ prepare_child_exe:
     xor di, di
     mov cx, word ptr cs:[exe_image_bytes]
     rep movsb
-    mov ax, CHILD_SEG + 0x10
+    mov ax, word ptr cs:[exec_load_segment]
+    add ax, 0x10
     add word ptr cs:[exe_cs], ax
     add word ptr cs:[exe_ss], ax
     clc
@@ -2516,7 +2638,7 @@ prepare_child_exe:
  * Only the command tail pointer at offsets +2/+4 is read, and a zero
  * environment segment inherits the fixed bootstrap environment. Errors
  * return through the parent INT 21h frame, success resumes after child exit.
- * No nested EXEC, handle inheritance, or arbitrary allocation yet.
+ * Nested EXEC remains unsupported; bounded dynamic child MCB allocation.
  */
 .L_dos_exec:
     cmp al, 0
@@ -2584,9 +2706,11 @@ prepare_child_exe:
 .L_exec_tail_end:
     mov byte ptr [si], 0
     pop cx
-    /* No parent memory is overwritten: the resident COMMAND.COM stays at
-     * 3000h while this .COM child loads at 5000h. */
-    mov word ptr [exec_load_segment], CHILD_SEG
+    /* Reserve a free DOS MCB before the loader touches child memory.
+     * Parent AH=48h allocations can force the child above 5000h. */
+    call reserve_exec_block
+    jc .L_exec_no_memory
+    mov word ptr [exec_load_segment], ax
     call load_com
     jc .L_exec_load_failed
     /* .EXE and .COM share the bounded floppy-file staging loader; for
@@ -2606,28 +2730,17 @@ prepare_child_exe:
     mov ax, ss
     mov word ptr [exec_parent_ss], ax
     mov word ptr [exec_parent_sp], bp
-    /* Construct a minimal, valid two-block MCB chain. */
-    mov ax, MEM_MCB
-    mov es, ax
-    mov byte ptr es:[0], 'M'
-    mov word ptr es:[1], APP_SEG
-    mov word ptr es:[3], CHILD_SEG - APP_SEG - 1
-    mov ax, CHILD_MCB
-    mov es, ax
-    mov byte ptr es:[0], 'Z'
-    mov word ptr es:[1], CHILD_SEG
-    mov word ptr es:[3], MEM_LIMIT - CHILD_SEG
-    mov ax, APP_SEG
-    mov es, ax
-    mov word ptr es:[2], CHILD_SEG
-    mov word ptr [current_psp], CHILD_SEG
+    /* MCB chain was updated by reserve_exec_block. No parent block
+     * may be truncated or overwritten at this stage. */
+    mov ax, word ptr [exec_load_segment]
+    mov word ptr [current_psp], ax
     mov word ptr [psp_parent], APP_SEG
     mov word ptr [current_env_seg], CHILD_ENV_SEG
     mov byte ptr [exec_active], 1
     call make_psp
     call inherit_child_handles
     cli
-    mov ax, CHILD_SEG
+    mov ax, word ptr [exec_load_segment]
     mov ds, ax
     mov es, ax
     cmp byte ptr cs:[exec_exe_mode], 0
@@ -2647,17 +2760,21 @@ prepare_child_exe:
     mov ax, word ptr cs:[exe_ss]
     mov ss, ax
     mov sp, word ptr cs:[exe_sp]
-    mov ax, CHILD_SEG
+    mov ax, word ptr cs:[exec_load_segment]
     mov ds, ax
     mov es, ax
     sti
     xor ax, ax
     jmp far ptr cs:[exe_ip]
 .L_exec_bad_environment:
+    mov ax, word ptr [exec_load_segment]
+    call release_process_blocks
     mov word ptr [exec_load_segment], APP_SEG
     mov ax, 10 /* invalid environment */
     jmp .L_set_error
 .L_exec_load_failed:
+    mov ax, word ptr [exec_load_segment]
+    call release_process_blocks
     mov word ptr [exec_load_segment], APP_SEG
     mov ax, 11 /* invalid EXE format / incomplete load */
     jmp .L_set_error
@@ -2674,8 +2791,8 @@ prepare_child_exe:
     mov ax, 8
     jmp .L_set_error
 
-/* Conventional memory MCB API. This prototype owns one MCB chain
- * in low memory and resets it between shell applications. No TSRs yet.
+/* Conventional memory MCB API. A persistent, owned MCB chain is maintained
+ * while a single EXEC child is running. No TSRs yet.
  * AH=48h: allocate BX paragraphs, AX=segment, failure BX=largest block.
  * AH=49h: release block at ES, AX=9 for invalid block.
  * AH=4Ah: resize ES to BX paragraphs, failure BX=maximum possible.
@@ -2849,6 +2966,18 @@ prepare_child_exe:
     mov word ptr es:[3], ax
     call merge_free_mcbs
 .L_mem_resize_ok:
+    /* Keep PSP:0002 synchronized with a successful resize of the
+     * process's own initial block. Other AH=4Ah blocks leave it alone. */
+    mov bx, word ptr ss:[bp + 12]
+    cmp bx, word ptr [current_psp]
+    jne .L_mem_resize_return
+    mov ax, word ptr es:[3]
+    add ax, bx
+    push es
+    mov es, bx
+    mov word ptr es:[2], ax
+    pop es
+.L_mem_resize_return:
     xor ax, ax
     jmp .L_int21_handler_return
 .L_mem_resize_fail:
@@ -4147,7 +4276,7 @@ environment_template:
     .word 1
     .asciz "A:\\VELVETDOS"
 environment_end:
-banner:             .asciz "\r\nVelvetDOS 0.10.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.11.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"

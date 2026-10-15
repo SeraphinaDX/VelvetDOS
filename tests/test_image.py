@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.10.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.11.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.10.0", kernel)
+        self.assertIn(b"VelvetDOS 0.11.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE", "EXECHK.EXE", "BADMZ.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -214,7 +214,7 @@ class FloppyTest(unittest.TestCase):
             self.root[i*32:i*32+11]
             for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
         ]
-        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
+        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
             self.assertIn(mkfloppy.dos_name(prog), names)
             self.assertGreater((BIN / prog).stat().st_size, 30)
 
@@ -287,7 +287,7 @@ class FloppyTest(unittest.TestCase):
         exiting = (BIN / "EXITTEST.COM").read_bytes()
         self.assertIn(b"EXITTEST.COM: returning code 2A", exiting)
         self.assertIn(b"\xb8\x2a\x4c", exiting) # AX=4C2A
-        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM"):
+        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
             self.assertIn(mkfloppy.dos_name(name),
                           [self.root[i*32:i*32+11] for i in range(224)])
 
@@ -296,22 +296,23 @@ class FloppyTest(unittest.TestCase):
         command = (ROOT / "programs" / "command.s").read_text()
         for marker in ("command_filename:", "call start_com", ".L_dos_exec:",
                        "exec_parent_ss:", "exec_parent_sp:", "exec_active:",
-                       "mov word ptr [current_psp], CHILD_SEG", "mov word ptr [current_psp], APP_SEG"):
+                       "mov word ptr [current_psp], ax", "mov word ptr [current_psp], APP_SEG"):
             self.assertIn(marker, source)
         self.assertIn('   .ascii "COMMAND COM"', source)
         self.assertIn("mov ah, 0x1a", command)
         self.assertIn("mov ax, 0x4b00", command)
         self.assertIn("mov ax, 0x4c00", command)
         self.assertIn("0x4e", command)  # DOS FindFirst
-        self.assertIn(b"COMMAND.COM 0.10.0", (BIN / "COMMAND.COM").read_bytes())
+        self.assertIn(b"COMMAND.COM 0.11.0", (BIN / "COMMAND.COM").read_bytes())
         self.assertIn(b"nested EXEC rejected", (BIN / "EXECCHK.COM").read_bytes())
 
     def test_process_memory_regions_do_not_overlap_kernel_or_data(self):
         source = (ROOT / "kernel" / "kernel.s").read_text()
         self.assertIn(".equ CHILD_SEG,      0x5000", source)
         self.assertIn(".equ CHILD_MCB,      0x4fff", source)
-        self.assertIn("mov word ptr es:[3], CHILD_SEG - APP_SEG - 1", source)
+        self.assertIn("mov word ptr es:[3], CHILD_MCB - APP_SEG", source)
         self.assertIn("mov word ptr es:[3], MEM_LIMIT - CHILD_SEG", source)
+        self.assertIn(".equ CHILD_PARAS,    0x1100", source)
         self.assertTrue((BIN / "COMMAND.COM").stat().st_size < 0x10000 - 256)
 
     def test_inherited_handle_and_environment_contract(self):
@@ -344,3 +345,46 @@ class FloppyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MemoryOwnershipTest(unittest.TestCase):
+    def test_child_memory_owner_paths_and_cleanup(self):
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        for marker in ("reserve_exec_block:", "release_process_blocks:",
+                       "call reserve_exec_block", "call release_process_blocks",
+                       "mov word ptr [exec_load_segment], ax"):
+            self.assertIn(marker, source)
+        exit_code = source.split("process_exit:", 1)[1].split(".L_exit_to_recovery_shell:", 1)[0]
+        self.assertIn("call release_process_blocks", exit_code)
+        self.assertNotIn("mov word ptr es:[3], MEM_LIMIT - APP_SEG", exit_code)
+
+    def test_child_program_and_shell_fixture(self):
+        child = (BIN / "MEMCHILD.COM").read_bytes()
+        shell = (BIN / "COMMAND.COM").read_bytes()
+        self.assertIn(b"MEMCHILD: dynamic child MCB / ownership PASS!", child)
+        self.assertIn(b"MEMOWN: parent MCB preserved, child MCBs reclaimed PASS!", shell)
+        self.assertIn(b"MEMOWN\0", shell)
+
+    def test_exec_reservation_preserves_return_stack(self):
+        """The MCB split path must not strand saved ES on the caller stack.
+
+        This was the 0.11.0 regression that caused EXEC to RET to a bogus
+        address after splitting a large free block. Static stack check only;
+        the executable runtime must also be tested in 86Box.
+        """
+        source = (ROOT / "kernel" / "kernel.s").read_text()
+        alloc = source.split("reserve_exec_block:", 1)[1].split("release_process_blocks:", 1)[0]
+        split = alloc.split("/* A new free MCB is located immediately after the child allocation. */", 1)[1].split(".L_reserve_whole:", 1)[0]
+        self.assertEqual(split.count("push es"), 1)
+        self.assertEqual(split.count("pop es"), 1)
+        self.assertEqual(alloc.count("push es"), alloc.count("pop es"))
+
+    def test_compiled_memory_ownership_binary(self):
+        binary = (BIN / "kernel.bin").read_bytes()
+        self.assertIn(b"VelvetDOS 0.11.0", binary)
+        self.assertLessEqual(len(binary), 32768)
+        # Compiler must not emit any 386-only 32-bit mode instruction prefix.
+        # Source explicitly requests .arch i8086 and real-mode .code16.
+        text = (ROOT / "kernel" / "kernel.s").read_text()
+        self.assertIn(".arch i8086", text)
+        self.assertIn(".code16", text)
