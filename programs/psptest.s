@@ -27,7 +27,9 @@ _start:
     jne failed
     cmp word ptr [0], 0x20cd  /* INT 20h */
     jne failed
-    cmp word ptr [2], 0x9000 /* exclusive segment of allocation */
+    mov ax, cs
+    add ax, 0x1100          /* child includes MZ stack headroom */
+    cmp word ptr [2], ax    /* exclusive end of own allocation */
     jne failed
     cmp word ptr [0x16], 0x3000
     jne failed

@@ -1,35 +1,19 @@
 # VelvetDOS development roadmap
 
-VelvetDOS targets 8086-class PCs and MS-DOS compatible 16-bit real-mode
-software. Early releases use assembly and host-side tooling; 386 DPMI and
-optional 32-bit Free Pascal programs are future work. All code: GPLv3-only.
+VelvetDOS is a clean GPLv3-only 8086-compatible DOS implementation.
+386 DOS extenders and optional Free Pascal tools are deferred.
 
-- [x] 0.1.0 — FAT12 floppy boot and COM execution (86Box verified)
-- [x] 0.2.0 — DOS handles, small MZ binaries, memory allocation (86Box verified)
-- [x] 0.3.0 — Writable FAT12 files (86Box verified)
-- [x] 0.4.0 — Directory navigation and 8.3 DOS path resolution (86Box verified)
-- [x] 0.5.0 — Find First/Next, attributes, timestamps, DTA, free space (86Box verified)
-- [x] 0.6.0 — Bounded FAT12 directory growth (86Box verified)
-- [x] 0.7.0 — PSP argument tail, environment, current PSP query, exit code
-      (86Box verified)
-- [x] 0.8.0 — Standalone COMMAND.COM, single-child COM EXEC and PSP parent
-      (86Box verified)
-- [ ] 0.9.0 — Bounded MZ child EXEC, .COM-to-.EXE shell fallback,
-      malformed MZ rejection (built + offline tests; awaiting 86Box)
-- [ ] 0.10.0+ — More complete executable memory ownership, environment,
-      handle inheritance, batch files, third-party DOS application trials
-- [ ] Later — FAT error recovery, traditional device drivers, FAT16, 386
-      protected mode, DPMI/GO32v2, optional 32-bit Free Pascal and self-hosting
+- [x] 0.1.0–0.7.0: FAT12, file APIs, COM/MZ, directory APIs, PSP and environment.
+- [x] 0.8.0: Standalone COMMAND.COM and basic child EXEC.
+- [x] 0.9.0: Bounded MZ child EXEC.
+- [x] 0.10.0: Handle inheritance and independent child environment.
+- [x] 0.11.0: Owner-based DOS memory management and stack hotfix (86Box tested).
+- [ ] 0.12.0: Small batch interpreter, SET/PATH, environment editing (86Box pending).
+- [ ] 0.13.0: Program lookup using PATH, DOS command processing refinements,
+  better batch constructs and third-party compiled DOS software trials.
+- [ ] Later: environment allocation/metadata, more DOS services, robust
+  multi-level EXEC, FAT16, traditional device drivers, DPMI/GO32v2 and optional
+  32-bit Free Pascal development, ultimately DOS-hosted tools.
 
-Use disposable images. Preserve a regression for every fixed disk or DOS API
-bug, and never claim DOS compatibility based solely on static tests.
-
-## 0.10.0 — Handle ownership (preview)
-
-- Per-process file-handle tables and reference counting across one resident
-  shell and one DOS EXEC child.
-- Bounded copied child environment, preserving parent's environment.
-- `HNDTEST` and `HNDCHILD.COM` parent/child I/O regression.
-- **After emulator validation:** consider more complete conventional-memory
-  allocation ownership and resize handling, preserving parent MCBs across
-  EXEC. Do not introduce Pascal until a 386-class DOS extender works.
+Prefer regression fixtures for every real DOS API bug. Offline image integrity
+checks do not replace CPU/emulator execution tests. Use disposable floppies.

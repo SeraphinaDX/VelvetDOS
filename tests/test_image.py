@@ -20,7 +20,7 @@ def fat_next(fat: bytes, cluster: int) -> int:
 class FloppyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.img = (BIN / "velvetdos-0.11.0.img").read_bytes()
+        cls.img = (BIN / "velvetdos-0.12.0.img").read_bytes()
         cls.fat = cls.img[65*512:(65+9)*512]
         cls.root = cls.img[83*512:97*512]
 
@@ -37,7 +37,7 @@ class FloppyTest(unittest.TestCase):
         kernel = (BIN / "kernel.bin").read_bytes()
         self.assertTrue(0 < len(kernel) <= 32768)
         self.assertEqual(self.img[512:512+len(kernel)], kernel)
-        self.assertIn(b"VelvetDOS 0.11.0", kernel)
+        self.assertIn(b"VelvetDOS 0.12.0", kernel)
 
     def test_both_fats_identical(self):
         self.assertEqual(self.fat[:3], b"\xf0\xff\xff")
@@ -46,7 +46,7 @@ class FloppyTest(unittest.TestCase):
     def test_program_contents_match_cluster_chains(self):
         names = ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "EXEDEMO.EXE", "EXECHK.EXE", "BADMZ.EXE",
                  "READ.COM", "MEMORY.COM", "README.TXT",
-                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM")
+                 "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM", "ENVCHK.COM", "DEMO.BAT")
         for i, name in enumerate(names):
             original = (BIN / name).read_bytes()
             item = self.root[i * 32:(i+1)*32]
@@ -66,7 +66,7 @@ class FloppyTest(unittest.TestCase):
 
     def test_dos_com_examples_have_valid_binary_headers(self):
         for name in ("HELLO.COM", "RETURN.COM", "CHAIN.COM", "READ.COM",
-                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
+                     "WRITE.COM", "APPEND.COM", "DELETE.COM", "RECHECK.COM", "PATHS.COM", "FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM", "ENVCHK.COM"):
             # Regressions are independently linked native .COM files; their first
             # opcodes may differ (MOV DX,imm16 vs MOV AX,imm16).
             self.assertGreater((BIN / name).stat().st_size, 30, name)
@@ -214,7 +214,7 @@ class FloppyTest(unittest.TestCase):
             self.root[i*32:i*32+11]
             for i in range(224) if self.root[i*32:i*32+1] not in (b"\x00", b"\xe5")
         ]
-        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
+        for prog in ("FINDTEST.COM", "VLIST.COM", "DIRGROW.COM", "PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM", "ENVCHK.COM"):
             self.assertIn(mkfloppy.dos_name(prog), names)
             self.assertGreater((BIN / prog).stat().st_size, 30)
 
@@ -287,7 +287,7 @@ class FloppyTest(unittest.TestCase):
         exiting = (BIN / "EXITTEST.COM").read_bytes()
         self.assertIn(b"EXITTEST.COM: returning code 2A", exiting)
         self.assertIn(b"\xb8\x2a\x4c", exiting) # AX=4C2A
-        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM"):
+        for name in ("PSPTEST.COM", "EXITTEST.COM", "COMMAND.COM", "EXECCHK.COM", "HNDCHILD.COM", "MEMCHILD.COM", "ENVCHK.COM"):
             self.assertIn(mkfloppy.dos_name(name),
                           [self.root[i*32:i*32+11] for i in range(224)])
 
@@ -303,7 +303,7 @@ class FloppyTest(unittest.TestCase):
         self.assertIn("mov ax, 0x4b00", command)
         self.assertIn("mov ax, 0x4c00", command)
         self.assertIn("0x4e", command)  # DOS FindFirst
-        self.assertIn(b"COMMAND.COM 0.11.0", (BIN / "COMMAND.COM").read_bytes())
+        self.assertIn(b"COMMAND.COM 0.12.0", (BIN / "COMMAND.COM").read_bytes())
         self.assertIn(b"nested EXEC rejected", (BIN / "EXECCHK.COM").read_bytes())
 
     def test_process_memory_regions_do_not_overlap_kernel_or_data(self):
@@ -343,8 +343,6 @@ class FloppyTest(unittest.TestCase):
             mkfloppy.dos_name("TOOLONGNAME.EXE")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MemoryOwnershipTest(unittest.TestCase):
@@ -381,10 +379,93 @@ class MemoryOwnershipTest(unittest.TestCase):
 
     def test_compiled_memory_ownership_binary(self):
         binary = (BIN / "kernel.bin").read_bytes()
-        self.assertIn(b"VelvetDOS 0.11.0", binary)
+        self.assertIn(b"VelvetDOS 0.12.0", binary)
         self.assertLessEqual(len(binary), 32768)
         # Compiler must not emit any 386-only 32-bit mode instruction prefix.
         # Source explicitly requests .arch i8086 and real-mode .code16.
         text = (ROOT / "kernel" / "kernel.s").read_text()
         self.assertIn(".arch i8086", text)
         self.assertIn(".code16", text)
+
+
+class BatchEnvironmentTest(unittest.TestCase):
+    def test_batch_fixture_is_dos_text_and_in_fat(self):
+        bat = (BIN / "DEMO.BAT").read_bytes()
+        self.assertIn(b"@ECHO OFF\r\n", bat)
+        self.assertIn(b"SET BATCHOK=YES\r\n", bat)
+        self.assertIn(b"PATH A:" + bytes((92,13,10)), bat)
+        self.assertIn(b"ENVCHK\r\n", bat)
+        self.assertIn(b"SET BATCHOK=\r\n", bat)
+        self.assertEqual(bat.count(b"\r\n"), bat.count(b"\n"))
+
+    def test_shell_has_batch_dos_file_calls_and_extension_fallback(self):
+        shell = (ROOT / "programs" / "command.s").read_text()
+        for text in ("batch_next_line:", "start_batch:", "do_set:", "do_path:",
+                     "commit_environment:", "append_old_env:",
+                     "show_env:", "show_path:", "mov ah, 0x3f",
+                     "mov ax, 0x3d00", "mov ah, 0x3e", "batch_handle:"):
+            self.assertIn(text, shell)
+        self.assertIn("mov byte ptr [di+3], 'T'", shell)
+        self.assertIn("cmp al, 10", shell)
+        self.assertIn("je .L_batch_ready", shell)
+        self.assertEqual(shell.split("append_old_env:", 1)[1].split("commit_environment:", 1)[0].count("push ds"), 1)
+        self.assertEqual(sum(line.strip() == "pop ds" for line in shell.split("append_old_env:", 1)[1].split("commit_environment:", 1)[0].splitlines()), 3)
+
+    def test_set_preserves_dos_environment_program_name_trailer(self):
+        """PSPTEST checks DOS count=1 + ASCIIZ program-name after variables.
+
+        Structural guard only: 86Box remains the authoritative runtime test.
+        """
+        shell = (ROOT / "programs" / "command.s").read_text()
+        commit = shell.split("commit_environment:", 1)[1].split("show_env:", 1)[0]
+        self.assertIn("mov word ptr [old_env_trailer], si", commit)
+        self.assertIn("cmp word ptr es:[si], 1", commit)
+        self.assertIn("mov word ptr [di], 1", commit)
+        self.assertIn(".L_commit_tail_name:", commit)
+        self.assertIn("mov al, byte ptr es:[si]", commit)
+        self.assertIn("jne .L_commit_tail_name", commit)
+        self.assertIn(".L_commit_fail:", commit)
+        self.assertIn("old_env_trailer: .word 0", shell)
+        batch = (BIN / "DEMO.BAT").read_bytes()
+        self.assertIn(b"SET BATCHOK=\r\n", batch)
+        self.assertIn(b"PSPTEST hello MiXeD 123\r\nSTATUS\r\n", batch)
+        self.assertGreater(batch.index(b"PSPTEST "), batch.index(b"SET BATCHOK=\r\n"))
+
+    def test_batch_file_handle_is_not_inherited_into_psptest(self):
+        """PSPTEST expects its child JFT slot 5 free even inside DEMO.BAT.
+
+        COMMAND.COM keeps its BAT file open during child EXEC, so open it with
+        DOS AH=3Dh bit 7 (non-inheritable) instead of leaking it into the PSP.
+        The unrelated HNDTEST file remains inheritable by default.
+        Host-only structural test; an 86Box run must verify JFT behavior.
+        """
+        kernel = (ROOT / "kernel" / "kernel.s").read_text()
+        shell = (ROOT / "programs" / "command.s").read_text()
+        bat_open = shell.split("start_batch:", 1)[1].split("batch_next_line:", 1)[0]
+        self.assertIn("mov ax, 0x3d80", bat_open)
+        self.assertIn(b"\xb8\x80\x3d\xcd\x21", (BIN / "COMMAND.COM").read_bytes())
+        self.assertIn("mov ax, 0x3d00", shell)  # HNDTEST remains inheritable
+        self.assertIn("handle_noinherit:  .space 4", kernel)
+        self.assertIn("cmp byte ptr cs:[handle_noinherit + si], 0", kernel)
+        self.assertIn("mov byte ptr [handle_noinherit + bx], al", kernel)
+        self.assertIn("mov byte ptr [handle_noinherit + bx], 0", kernel)
+        self.assertIn("test byte ptr [open_mode], 3", kernel)
+        self.assertIn("cmp byte ptr [0x1d], 0xff", (ROOT / "programs" / "psptest.s").read_text())
+        self.assertIn(b"PSPTEST hello MiXeD 123\r\n", (BIN / "DEMO.BAT").read_bytes())
+
+    def test_native_child_checks_psp_environment(self):
+        elf = (BIN / "ENVCHK.COM").read_bytes()
+        self.assertIn(b"BATCHOK=YES\0", elf)
+        self.assertIn(b"ENVCHK.COM: child inherited BATCHOK=YES PASS!", elf)
+        self.assertIn(bytes((0xb8, 0, 0x4c)), elf)  # DOS exit code 0
+        self.assertIn(bytes((0xb8, 1, 0x4c)), elf)  # DOS exit code 1
+
+    def test_root_contains_bat_and_executable(self):
+        data = (BIN / "velvetdos-0.12.0.img").read_bytes()
+        directory = data[83*512:97*512]
+        names = [directory[i*32:i*32+11] for i in range(224)]
+        self.assertIn(mkfloppy.dos_name("DEMO.BAT"), names)
+        self.assertIn(mkfloppy.dos_name("ENVCHK.COM"), names)
+
+if __name__ == "__main__":
+    unittest.main()

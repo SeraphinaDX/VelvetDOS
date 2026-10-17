@@ -1,4 +1,4 @@
-/* VelvetDOS 0.11.0 -- experimental 16-bit DOS-compatible kernel.
+/* VelvetDOS 0.12.0 -- experimental 16-bit DOS-compatible kernel.
  * SPDX-License-Identifier: GPL-3.0-only
  * Linked at offset 0, loaded by the boot sector at physical 0x10000.
  * FAT12 root and bounded multi-cluster directories (8.3); one resident shell
@@ -784,7 +784,7 @@ reset_mcb:
     xor al, al
     rep stosb
     mov di, offset handle_refs
-    mov cx, 4
+    mov cx, 8                /* 4 reference counts + 4 inherit flags */
     rep stosb
     mov word ptr [rw_cached_sector], 0xffff
     mov byte ptr [rw_cache_dirty], 0
@@ -1581,7 +1581,8 @@ start_com:
     xor ax, ax
     retf
 
-/* Copy parent's four file JFT slots to child and increase reference counts.
+/* Copy inheritable parent file JFT slots to child and increase reference
+ * counts. MS-DOS open mode AL bit 7 marks a handle as non-inheritable.
  * Std handles 0..4 are initialized by make_psp. An inherited close does not
  * invalidate the parent's copy of the same DOS file handle. */
 inherit_child_handles:
@@ -1599,9 +1600,11 @@ inherit_child_handles:
     mov al, byte ptr [bx + 0x18]
     cmp al, 0xff
     je .L_ich_skip
-    mov byte ptr es:[bx + 0x18], al
     mov si, bx
     sub si, 5
+    cmp byte ptr cs:[handle_noinherit + si], 0
+    jne .L_ich_skip
+    mov byte ptr es:[bx + 0x18], al
     inc byte ptr cs:[handle_refs + si]
 .L_ich_skip:
     inc bx
@@ -2163,8 +2166,8 @@ int21_handler:
     jnz .L_open_denied
     test byte ptr [file_attributes], 1
     jz .L_open_get_slot
-    cmp byte ptr [open_mode], 0
-    jne .L_open_denied
+    test byte ptr [open_mode], 3   /* ignore no-inherit bit 7 */
+    jnz .L_open_denied
 .L_open_get_slot:
     call find_handle_slot
     jc .L_open_no_slots
@@ -2172,6 +2175,15 @@ int21_handler:
     and al, 3
     mov byte ptr [si + 1], al
     call fill_handle
+    /* AL bit 7 of AH=3Dh open mode requests private (non-inherited) handle.
+     * Track it per file record, not in the read/write access-mode byte. */
+    push bx
+    mov bx, dx
+    sub bx, 5
+    mov al, byte ptr [open_mode]
+    and al, 0x80
+    mov byte ptr [handle_noinherit + bx], al
+    pop bx
     mov ax, dx
     jmp .L_int21_handler_return
 .L_open_denied:
@@ -3553,6 +3565,7 @@ fill_handle:
     mov bx, dx
     sub bx, 5
     mov byte ptr [handle_refs + bx], 1
+    mov byte ptr [handle_noinherit + bx], 0 /* inherited by default */
     mov ax, word ptr [current_psp]
     mov es, ax
     mov byte ptr es:[bx + 0x1d], dl
@@ -3887,6 +3900,7 @@ release_handle:
     jnz .L_rh_ok
     call update_root_handle
     mov byte ptr [bx], 0
+    mov byte ptr [handle_noinherit + di], 0
 .L_rh_ok:
     clc
     jmp .L_rh_done
@@ -4197,6 +4211,7 @@ rw_mode:           .byte 0
 .align 2
 handles:           .space 64  /* 4 x 16-byte read/write handle records */
 handle_refs:       .space 4   /* references across shell + child JFTs */
+handle_noinherit:  .space 4   /* DOS 3Dh AL bit 7: suppress child JFT copy */
 open_mode:         .byte 0
 file_attributes:   .byte 0
 fs_dirty:          .byte 0
@@ -4276,7 +4291,7 @@ environment_template:
     .word 1
     .asciz "A:\\VELVETDOS"
 environment_end:
-banner:             .asciz "\r\nVelvetDOS 0.11.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
+banner:             .asciz "\r\nVelvetDOS 0.12.0  [pre-alpha]\r\nGNU GPLv3 | Type HELP for commands.\r\n"
 prompt:             .asciz "\r\nA:\\"
 cmd_help:           .asciz "HELP"
 cmd_dir:            .asciz "DIR"

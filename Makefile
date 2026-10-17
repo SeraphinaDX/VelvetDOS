@@ -3,7 +3,7 @@ AS ?= as
 LD ?= ld
 PYTHON ?= python3
 BUILD := build
-IMAGE := $(BUILD)/velvetdos-0.10.0.img
+IMAGE := $(BUILD)/velvetdos-0.12.0.img
 
 .PHONY: all image run test clean help
 all: image
@@ -104,6 +104,8 @@ $(BUILD)/EXECCHK.COM: $(BUILD)/execchk.padded
 	dd if=$< of=$@ bs=1 skip=256 status=none
 $(BUILD)/HNDCHILD.COM: $(BUILD)/hndchild.padded
 	dd if=$< of=$@ bs=1 skip=256 status=none
+$(BUILD)/MEMCHILD.COM: $(BUILD)/memchild.padded
+	dd if=$< of=$@ bs=1 skip=256 status=none
 
 $(BUILD)/COMMAND.COM: $(BUILD)/command.padded
 	dd if=$< of=$@ bs=1 skip=256 status=none
@@ -113,11 +115,17 @@ $(BUILD)/PSPTEST.COM: $(BUILD)/psptest.padded
 $(BUILD)/EXITTEST.COM: $(BUILD)/exittest.padded
 	dd if=$< of=$@ bs=1 skip=256 status=none
 
-$(BUILD)/README.TXT: | $(BUILD)
-	$(PYTHON) -c "from pathlib import Path; Path('$@').write_bytes(b'VELVETDOS 0.10.0 PROGRAM API TEST\r\n' + b'FAT12 READ TEST DATA!\r\n' * 40)"
+$(BUILD)/ENVCHK.COM: $(BUILD)/envchk.padded
+	dd if=$< of=$@ bs=1 skip=256 status=none
 
-$(IMAGE): $(BUILD)/boot.bin $(BUILD)/kernel.bin $(BUILD)/HELLO.COM $(BUILD)/RETURN.COM $(BUILD)/CHAIN.COM $(BUILD)/EXEDEMO.EXE $(BUILD)/EXECHK.EXE $(BUILD)/BADMZ.EXE $(BUILD)/READ.COM $(BUILD)/MEMORY.COM $(BUILD)/README.TXT $(BUILD)/WRITE.COM $(BUILD)/APPEND.COM $(BUILD)/DELETE.COM $(BUILD)/RECHECK.COM $(BUILD)/PATHS.COM $(BUILD)/FINDTEST.COM $(BUILD)/VLIST.COM $(BUILD)/DIRGROW.COM $(BUILD)/PSPTEST.COM $(BUILD)/EXITTEST.COM $(BUILD)/COMMAND.COM $(BUILD)/EXECCHK.COM $(BUILD)/HNDCHILD.COM tools/mkfloppy.py
-	$(PYTHON) tools/mkfloppy.py --boot $(BUILD)/boot.bin --kernel $(BUILD)/kernel.bin --file $(BUILD)/HELLO.COM --file $(BUILD)/RETURN.COM --file $(BUILD)/CHAIN.COM --file $(BUILD)/EXEDEMO.EXE --file $(BUILD)/EXECHK.EXE --file $(BUILD)/BADMZ.EXE --file $(BUILD)/READ.COM --file $(BUILD)/MEMORY.COM --file $(BUILD)/README.TXT --file $(BUILD)/WRITE.COM --file $(BUILD)/APPEND.COM --file $(BUILD)/DELETE.COM --file $(BUILD)/RECHECK.COM --file $(BUILD)/PATHS.COM --file $(BUILD)/FINDTEST.COM --file $(BUILD)/VLIST.COM --file $(BUILD)/DIRGROW.COM --file $(BUILD)/PSPTEST.COM --file $(BUILD)/EXITTEST.COM --file $(BUILD)/COMMAND.COM --file $(BUILD)/EXECCHK.COM --file $(BUILD)/HNDCHILD.COM --output $@
+$(BUILD)/DEMO.BAT: programs/DEMO.BAT | $(BUILD)
+	$(PYTHON) -c "from pathlib import Path; p=Path('$<'); Path('$@').write_bytes(p.read_bytes().replace(bytes((13,10)), bytes((10,))).replace(bytes((10,)), bytes((13,10))))"
+
+$(BUILD)/README.TXT: | $(BUILD)
+	$(PYTHON) -c "from pathlib import Path; Path('$@').write_bytes(b'VELVETDOS 0.12.0 PROGRAM API TEST\r\n' + b'FAT12 READ TEST DATA!\r\n' * 40)"
+
+$(IMAGE): $(BUILD)/boot.bin $(BUILD)/kernel.bin $(BUILD)/HELLO.COM $(BUILD)/RETURN.COM $(BUILD)/CHAIN.COM $(BUILD)/EXEDEMO.EXE $(BUILD)/EXECHK.EXE $(BUILD)/BADMZ.EXE $(BUILD)/READ.COM $(BUILD)/MEMORY.COM $(BUILD)/README.TXT $(BUILD)/WRITE.COM $(BUILD)/APPEND.COM $(BUILD)/DELETE.COM $(BUILD)/RECHECK.COM $(BUILD)/PATHS.COM $(BUILD)/FINDTEST.COM $(BUILD)/VLIST.COM $(BUILD)/DIRGROW.COM $(BUILD)/PSPTEST.COM $(BUILD)/EXITTEST.COM $(BUILD)/COMMAND.COM $(BUILD)/EXECCHK.COM $(BUILD)/HNDCHILD.COM $(BUILD)/MEMCHILD.COM $(BUILD)/ENVCHK.COM $(BUILD)/DEMO.BAT tools/mkfloppy.py
+	$(PYTHON) tools/mkfloppy.py --boot $(BUILD)/boot.bin --kernel $(BUILD)/kernel.bin --file $(BUILD)/HELLO.COM --file $(BUILD)/RETURN.COM --file $(BUILD)/CHAIN.COM --file $(BUILD)/EXEDEMO.EXE --file $(BUILD)/EXECHK.EXE --file $(BUILD)/BADMZ.EXE --file $(BUILD)/READ.COM --file $(BUILD)/MEMORY.COM --file $(BUILD)/README.TXT --file $(BUILD)/WRITE.COM --file $(BUILD)/APPEND.COM --file $(BUILD)/DELETE.COM --file $(BUILD)/RECHECK.COM --file $(BUILD)/PATHS.COM --file $(BUILD)/FINDTEST.COM --file $(BUILD)/VLIST.COM --file $(BUILD)/DIRGROW.COM --file $(BUILD)/PSPTEST.COM --file $(BUILD)/EXITTEST.COM --file $(BUILD)/COMMAND.COM --file $(BUILD)/EXECCHK.COM --file $(BUILD)/HNDCHILD.COM --file $(BUILD)/MEMCHILD.COM --file $(BUILD)/ENVCHK.COM --file $(BUILD)/DEMO.BAT --output $@
 
 run: image
 	qemu-system-i386 -drive file=$(IMAGE),format=raw,if=floppy -boot a -m 16 -no-reboot
